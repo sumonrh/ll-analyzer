@@ -814,15 +814,19 @@ const BeamReactionDiagram = ({
                     {String.fromCharCode(65 + idx)}
                 </text>
 
-                {/* Reaction arrow (upward) - positioned below ground line */}
+                {/* Reaction arrow (upward) - line and arrowhead */}
                 <line
                     x1={xPos}
                     y1={beamY + triangleSize + 55}
                     x2={xPos}
-                    y2={beamY + triangleSize + 32}
+                    y2={beamY + triangleSize + 35}
                     stroke="#dc2626"
                     strokeWidth="2.5"
-                    markerEnd="url(#reactionArrow)"
+                />
+                {/* Arrowhead pointing UP */}
+                <polygon
+                    points={`${xPos - 5},${beamY + triangleSize + 35} ${xPos},${beamY + triangleSize + 27} ${xPos + 5},${beamY + triangleSize + 35}`}
+                    fill="#dc2626"
                 />
 
                 {/* Reaction value - at bottom */}
@@ -844,10 +848,10 @@ const BeamReactionDiagram = ({
         <div ref={containerRef} className="w-full bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6">
             <h3 className="text-lg font-semibold text-gray-800 mb-2">Maximum Support Reactions</h3>
             <svg width={width} height={height} className="overflow-visible">
-                {/* Reaction arrow marker */}
+                {/* Reaction arrow marker - pointing upward */}
                 <defs>
-                    <marker id="reactionArrow" markerWidth="8" markerHeight="8" refX="4" refY="0" orient="auto">
-                        <path d="M0,8 L4,0 L8,8" fill="#dc2626" />
+                    <marker id="reactionArrow" markerWidth="10" markerHeight="10" refX="5" refY="10" orient="auto">
+                        <path d="M0,10 L5,0 L10,10 Z" fill="#dc2626" />
                     </marker>
                 </defs>
 
