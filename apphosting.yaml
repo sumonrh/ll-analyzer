@@ -1,0 +1,15 @@
+runConfig:
+  # No runtime settings needed for static site
+
+env:
+  - variable: NODE_ENV
+    value: production
+
+# Build configuration for Vite React app in subdirectory
+rootDirectory: gaad-app
+
+# Build settings
+buildCommand: npm install && npm run build
+
+# Output directory (relative to rootDirectory)
+outputDirectory: dist
