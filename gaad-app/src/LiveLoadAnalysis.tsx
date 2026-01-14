@@ -758,8 +758,8 @@ const BeamReactionDiagram = ({
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const [width, setWidth] = useState(600);
-    const height = 160;
-    const padding = { top: 40, right: 40, bottom: 50, left: 40 };
+    const height = 200;
+    const padding = { top: 30, right: 60, bottom: 60, left: 60 };
 
     useEffect(() => {
         if (containerRef.current) setWidth(containerRef.current.clientWidth);
@@ -771,10 +771,10 @@ const BeamReactionDiagram = ({
     const totalLen = spans.reduce((a, b) => a + b.length, 0);
     if (totalLen === 0 || !reactions || reactions.length === 0) return null;
 
-    const beamY = height / 2;
+    const beamY = 55;
     const xScale = (val: number) => padding.left + (val / totalLen) * (width - padding.left - padding.right);
 
-    const triangleSize = 12;
+    const triangleSize = 10;
 
     const renderSupportWithReaction = (x: number, idx: number, reaction: ReactionEnvelope) => {
         const xPos = xScale(x);
@@ -784,40 +784,51 @@ const BeamReactionDiagram = ({
 
         return (
             <g key={`support-${idx}`}>
-                {/* Reaction arrow (upward) */}
-                <line
-                    x1={xPos}
-                    y1={beamY + triangleSize + 25}
-                    x2={xPos}
-                    y2={beamY + 8}
-                    stroke="#dc2626"
-                    strokeWidth="2"
-                    markerEnd="url(#reactionArrow)"
-                />
-
                 {/* Triangle support */}
                 <polygon
-                    points={`${xPos},${beamY + 4} ${xPos - triangleSize},${beamY + triangleSize + 8} ${xPos + triangleSize},${beamY + triangleSize + 8}`}
+                    points={`${xPos},${beamY + 4} ${xPos - triangleSize},${beamY + triangleSize + 6} ${xPos + triangleSize},${beamY + triangleSize + 6}`}
                     fill="#374151"
                     stroke="#1f2937"
                     strokeWidth="1"
                 />
 
-                {/* Support label */}
+                {/* Ground line under triangle */}
+                <line
+                    x1={xPos - triangleSize - 3}
+                    y1={beamY + triangleSize + 8}
+                    x2={xPos + triangleSize + 3}
+                    y2={beamY + triangleSize + 8}
+                    stroke="#1f2937"
+                    strokeWidth="2"
+                />
+
+                {/* Support label (A, B, C, D) - positioned to the side */}
                 <text
                     x={xPos}
-                    y={beamY + triangleSize + 22}
+                    y={beamY + triangleSize + 25}
                     textAnchor="middle"
-                    fontSize="10"
-                    fill="#6b7280"
+                    fontSize="11"
+                    fill="#374151"
+                    fontWeight="600"
                 >
                     {String.fromCharCode(65 + idx)}
                 </text>
 
-                {/* Reaction value */}
+                {/* Reaction arrow (upward) - positioned below ground line */}
+                <line
+                    x1={xPos}
+                    y1={beamY + triangleSize + 55}
+                    x2={xPos}
+                    y2={beamY + triangleSize + 32}
+                    stroke="#dc2626"
+                    strokeWidth="2.5"
+                    markerEnd="url(#reactionArrow)"
+                />
+
+                {/* Reaction value - at bottom */}
                 <text
                     x={xPos}
-                    y={beamY + triangleSize + 45}
+                    y={beamY + triangleSize + 72}
                     textAnchor="middle"
                     fontSize="11"
                     fill="#dc2626"
@@ -835,7 +846,7 @@ const BeamReactionDiagram = ({
             <svg width={width} height={height} className="overflow-visible">
                 {/* Reaction arrow marker */}
                 <defs>
-                    <marker id="reactionArrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+                    <marker id="reactionArrow" markerWidth="8" markerHeight="8" refX="4" refY="0" orient="auto">
                         <path d="M0,8 L4,0 L8,8" fill="#dc2626" />
                     </marker>
                 </defs>
@@ -851,7 +862,7 @@ const BeamReactionDiagram = ({
                     strokeLinecap="round"
                 />
 
-                {/* Span labels */}
+                {/* Span labels - above beam */}
                 {spans.map((span, idx) => {
                     let startX = 0;
                     for (let i = 0; i < idx; i++) startX += spans[i].length;
@@ -859,16 +870,30 @@ const BeamReactionDiagram = ({
                     const midX = (startX + endX) / 2;
 
                     return (
-                        <text
-                            key={`span-label-${idx}`}
-                            x={xScale(midX)}
-                            y={beamY - 15}
-                            textAnchor="middle"
-                            fontSize="10"
-                            fill="#6b7280"
-                        >
-                            Span {idx + 1} ({span.length}m)
-                        </text>
+                        <g key={`span-label-${idx}`}>
+                            {/* Dimension line */}
+                            <line
+                                x1={xScale(startX) + 5}
+                                y1={beamY - 18}
+                                x2={xScale(endX) - 5}
+                                y2={beamY - 18}
+                                stroke="#9ca3af"
+                                strokeWidth="1"
+                            />
+                            {/* End ticks */}
+                            <line x1={xScale(startX) + 5} y1={beamY - 14} x2={xScale(startX) + 5} y2={beamY - 22} stroke="#9ca3af" strokeWidth="1" />
+                            <line x1={xScale(endX) - 5} y1={beamY - 14} x2={xScale(endX) - 5} y2={beamY - 22} stroke="#9ca3af" strokeWidth="1" />
+                            {/* Label */}
+                            <text
+                                x={xScale(midX)}
+                                y={beamY - 25}
+                                textAnchor="middle"
+                                fontSize="10"
+                                fill="#6b7280"
+                            >
+                                {span.length}m
+                            </text>
+                        </g>
                     );
                 })}
 
@@ -877,7 +902,7 @@ const BeamReactionDiagram = ({
                     reactions[idx] && renderSupportWithReaction(pos, idx, reactions[idx])
                 )}
             </svg>
-            <div className="flex justify-center gap-4 mt-2 text-xs text-gray-500">
+            <div className="flex justify-center gap-4 mt-1 text-xs text-gray-500">
                 <span>↑ Maximum reaction forces shown</span>
             </div>
         </div>
