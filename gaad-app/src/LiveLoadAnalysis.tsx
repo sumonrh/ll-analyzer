@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Play, RotateCcw, Plus, Trash2, Settings, ChevronDown, ChevronUp, AlertCircle, Download } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Play, RotateCcw, Plus, Trash2, Settings, AlertCircle, Download } from 'lucide-react';
 
 // --- TYPES ---
 
@@ -301,8 +301,8 @@ class BeamFEM {
         runPass(activeAxles);
 
         // Reverse Pass
-        const revAxles = [...activeAxles].reverse().map((a, i, arr) => {
-            const nextSpacing = i < arr.length - 1 ? arr[i + 1].spacing : 0;
+        const _revAxles = [...activeAxles].reverse().map((a, i, arr) => {
+            const _nextSpacing = i < arr.length - 1 ? arr[i + 1].spacing : 0;
             return { ...a, spacing: i < arr.length - 1 ? activeAxles[activeAxles.length - 2 - i].spacing : 0 };
         });
 
@@ -369,7 +369,7 @@ class BeamFEM {
         I: number,
         K_Global: number[][],
         F: number[],
-        constrained: boolean[],
+        _constrained: boolean[],
         nElemsPerSpan: number,
         numSpans: number
     ) {
@@ -483,6 +483,7 @@ const EnvelopeChart = ({
     title,
     unit,
     color,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     flipY = false
 }: {
     data: any[],
@@ -915,7 +916,7 @@ const BeamReactionDiagram = ({
 
 export default function BeamAnalysisApp() {
     const [spans, setSpans] = useState<Span[]>(DEFAULT_SPANS);
-    const [axles, setAxles] = useState<Axle[]>(DEFAULT_AXLES);
+    const [axles, _setAxles] = useState<Axle[]>(DEFAULT_AXLES);
     const [config, setConfig] = useState<AnalysisConfig>(DEFAULT_CONFIG);
     const [results, setResults] = useState<AnalysisResults | null>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
