@@ -6,7 +6,7 @@ env:
     value: production
 
 # Build configuration for Vite React app in subdirectory
-rootDirectory: gaad-app
+rootDirectory: ll-analyzer
 
 # Build settings
 buildCommand: npm install && npm run build

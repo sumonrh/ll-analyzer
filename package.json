@@ -1,13 +1,13 @@
 {
-    "name": "gaad-root",
+    "name": "ll-analyzer-root",
     "version": "1.0.0",
     "private": true,
     "workspaces": [
-        "gaad-app"
+        "ll-analyzer"
     ],
     "scripts": {
-        "build": "npm run build --workspace=gaad-app",
-        "dev": "npm run dev --workspace=gaad-app",
-        "lint": "npm run lint --workspace=gaad-app"
+        "build": "npm run build --workspace=ll-analyzer",
+        "dev": "npm run dev --workspace=ll-analyzer",
+        "lint": "npm run lint --workspace=ll-analyzer"
     }
 }
