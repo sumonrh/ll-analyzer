@@ -41,8 +41,8 @@ This project uses `npm` as the package manager and `vite` for fast local develop
 
 ## Contributing
 
-Contributions, bug reports, and feature requests are welcome! Feel free to modify, upgrade, and fork the application for educational and non-commercial purposes. Please refer to the [LICENSE](LICENSE) file for more information on user restrictions.
+Contributions, bug reports, and feature requests are welcome! Feel free to modify, upgrade, and fork the application for educational and engineering purposes. Please refer to the [LICENSE](LICENSE) file for more information on user restrictions (e.g., selling the software itself is prohibited, but using it for paid consulting services is allowed).
 
 ## License
 
-This project is licensed under a Custom Non-Commercial License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under a Custom License. See the [LICENSE](LICENSE) file for details.
