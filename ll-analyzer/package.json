@@ -4,8 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "node -e \"const fs=require('fs');if(fs.existsSync('index.template.html'))fs.copyFileSync('index.template.html','index.html')\" && vite",
+    "build": "node ../build-standalone.mjs",
+    "build:app": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "serve -s dist -l 8080"

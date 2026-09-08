@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Play, RotateCcw, Plus, Trash2, Settings, AlertCircle, Download } from 'lucide-react';
 
 // --- TYPES ---
@@ -20,6 +20,7 @@ type AnalysisConfig = {
     nElemsPerSpan: number;
     truckIncrement: number;
     loadCase: 'truck' | 'lane';
+    dlaOverride?: number | null;
 };
 
 type EnvelopePoint = {
@@ -41,6 +42,7 @@ type AnalysisResults = {
     xNodes: number[];
     reactions: ReactionEnvelope[];
     supportPositions: number[];
+    dlaUsed?: number;
 };
 
 // --- CONSTANTS ---
@@ -65,6 +67,7 @@ const DEFAULT_CONFIG: AnalysisConfig = {
     nElemsPerSpan: 32,
     truckIncrement: 0.5,
     loadCase: 'truck',
+    dlaOverride: null,
 };
 
 // --- FEM ENGINE (Ported from VBA) ---
@@ -78,6 +81,27 @@ class BeamFEM {
         this.spans = spans;
         this.axles = axles;
         this.config = config;
+    }
+
+    private calculateAutoDla(): number {
+        const maxSpan = Math.max(...this.spans.map(s => s.length), 0);
+        let maxAxlesOnSpan = 1;
+        for (let i = 0; i < this.axles.length; i++) {
+            let count = 1;
+            let cumulativeDist = 0;
+            for (let j = i; j < this.axles.length - 1; j++) {
+                cumulativeDist += this.axles[j].spacing;
+                if (cumulativeDist <= maxSpan + 0.000001) {
+                    count++;
+                } else {
+                    break;
+                }
+            }
+            if (count > maxAxlesOnSpan) maxAxlesOnSpan = count;
+        }
+        if (maxAxlesOnSpan <= 1) return 0.40;
+        if (maxAxlesOnSpan === 2) return 0.30;
+        return 0.25;
     }
 
     // Gaussian Elimination Solver
@@ -211,13 +235,57 @@ class BeamFEM {
         let activeAxles = [...this.axles];
         let w_udl = 0;
 
+        const autoDla = this.calculateAutoDla();
+        const dla = (this.config.dlaOverride !== undefined && this.config.dlaOverride !== null)
+            ? this.config.dlaOverride
+            : autoDla; // const dla = 0.25;
+
         if (loadCase === 'lane') {
             w_udl = 9; // kN/m
             activeAxles = activeAxles.map(a => ({ ...a, load: a.load * 0.8 }));
         } else {
-            const dla = 0.25;
             activeAxles = activeAxles.map(a => ({ ...a, load: a.load * (1 + dla) }));
         }
+
+        // 4b. Factorize reduced stiffness matrix once into LU for O(n^2) solve per position
+        const freeMap: number[] = [];
+        for (let i = 0; i < nDOF; i++) {
+            if (!constrained[i]) freeMap.push(i);
+        }
+        const nFree = freeMap.length;
+        const LU: number[][] = Array(nFree).fill(0).map(() => Array(nFree).fill(0));
+        for (let i = 0; i < nFree; i++) {
+            for (let j = 0; j < nFree; j++) {
+                LU[i][j] = K_Global[freeMap[i]][freeMap[j]];
+            }
+        }
+        for (let k = 0; k < nFree - 1; k++) {
+            for (let i = k + 1; i < nFree; i++) {
+                const factor = LU[i][k] / LU[k][k];
+                LU[i][k] = factor;
+                for (let j = k + 1; j < nFree; j++) {
+                    LU[i][j] -= factor * LU[k][j];
+                }
+            }
+        }
+
+        const solveFactored = (F: number[]): number[] => {
+            const y: number[] = Array(nFree);
+            for (let i = 0; i < nFree; i++) y[i] = F[freeMap[i]];
+            for (let i = 1; i < nFree; i++) {
+                let sum = 0;
+                for (let j = 0; j < i; j++) sum += LU[i][j] * y[j];
+                y[i] -= sum;
+            }
+            for (let i = nFree - 1; i >= 0; i--) {
+                let sum = 0;
+                for (let j = i + 1; j < nFree; j++) sum += LU[i][j] * y[j];
+                y[i] = (y[i] - sum) / LU[i][i];
+            }
+            const U_Full = Array(nDOF).fill(0);
+            for (let i = 0; i < nFree; i++) U_Full[freeMap[i]] = y[i];
+            return U_Full;
+        };
 
         // 5. UDL Analysis (Simplified Worst Case approximation for demo: apply to all spans)
         const udlResults = { v: Array(xShear.length).fill(0), m: Array(nNodes).fill(0), d: Array(nNodes).fill(0) };
@@ -225,6 +293,7 @@ class BeamFEM {
         if (w_udl > 0) {
             // Single pass UDL on all spans
             const F_UDL = Array(nDOF).fill(0);
+            const elemLoads_UDL = Array.from({ length: nTotalElems }, () => [0, 0, 0, 0]);
             let elemCounter = 0;
             for (const span of this.spans) {
                 const le = span.length / nElemsPerSpan;
@@ -238,11 +307,17 @@ class BeamFEM {
                     F_UDL[nI + 1] += Mom;
                     F_UDL[nJ] += Fy;
                     F_UDL[nJ + 1] -= Mom;
+
+                    elemLoads_UDL[elemCounter][0] = Fy;
+                    elemLoads_UDL[elemCounter][1] = Mom;
+                    elemLoads_UDL[elemCounter][2] = Fy;
+                    elemLoads_UDL[elemCounter][3] = -Mom;
+
                     elemCounter++;
                 }
             }
-            const U_UDL = this.solveSystem(K_Global, F_UDL, constrained);
-            const forces = this.calculateForces(U_UDL, nTotalElems, elemLens, E, I, K_Global, F_UDL, constrained, nElemsPerSpan, numSpans);
+            const U_UDL = solveFactored(F_UDL);
+            const forces = this.calculateForces(U_UDL, nTotalElems, elemLens, E, I, K_Global, F_UDL, constrained, nElemsPerSpan, numSpans, elemLoads_UDL);
             udlResults.v = forces.v;
             udlResults.m = forces.m;
             udlResults.d = forces.d;
@@ -256,19 +331,37 @@ class BeamFEM {
 
         // Helper to run a pass
         const runPass = (axles: Axle[]) => {
-            for (let pos = startPos; pos <= endPos; pos += truckIncrement) {
+            const posSet = new Set<number>();
+            for (let pos = startPos; pos <= endPos + 0.000001; pos += truckIncrement) {
+                posSet.add(Math.round(pos * 100000) / 100000);
+            }
+            // Explicitly include exact support alignments so axles land directly on every support
+            for (const suppX of supportPositions) {
+                let dist = 0;
+                for (let k = 0; k < axles.length; k++) {
+                    const lead = suppX + dist;
+                    if (lead >= startPos - 0.001 && lead <= endPos + 0.001) {
+                        posSet.add(Math.round(lead * 100000) / 100000);
+                    }
+                    if (k < axles.length - 1) dist += axles[k].spacing;
+                }
+            }
+            const sweepPositions = Array.from(posSet).sort((a, b) => a - b);
+
+            for (const pos of sweepPositions) {
                 const F = Array(nDOF).fill(0);
+                const elemLoads = Array.from({ length: nTotalElems }, () => [0, 0, 0, 0]);
 
                 let axPos = pos;
-                this.applyPointLoad(F, axPos, axles[0].load, elemLens, xNodes);
+                this.applyPointLoad(F, elemLoads, axPos, axles[0].load, elemLens, xNodes);
 
                 for (let k = 0; k < axles.length - 1; k++) {
                     axPos -= axles[k].spacing;
-                    this.applyPointLoad(F, axPos, axles[k + 1].load, elemLens, xNodes);
+                    this.applyPointLoad(F, elemLoads, axPos, axles[k + 1].load, elemLens, xNodes);
                 }
 
-                const U = this.solveSystem(K_Global, F, constrained);
-                const { v, m, d, reactions } = this.calculateForces(U, nTotalElems, elemLens, E, I, K_Global, F, constrained, nElemsPerSpan, numSpans);
+                const U = solveFactored(F);
+                const { v, m, d, reactions } = this.calculateForces(U, nTotalElems, elemLens, E, I, K_Global, F, constrained, nElemsPerSpan, numSpans, elemLoads);
 
                 // Update Envelopes
                 // Shear (Stepped)
@@ -321,13 +414,16 @@ class BeamFEM {
             deflection: defEnv,
             xNodes,
             reactions: reactionEnv,
-            supportPositions
+            supportPositions,
+            dlaUsed: dla
         };
     }
 
-    private applyPointLoad(F: number[], pos: number, mag: number, elemLens: number[], xNodes: number[]) {
+    private applyPointLoad(F: number[], elemLoads: number[][], pos: number, mag: number, elemLens: number[], xNodes: number[]) {
         const totalLen = xNodes[xNodes.length - 1];
-        if (pos < 0 || pos > totalLen) return;
+        if (pos < -0.0001 || pos > totalLen + 0.0001) return;
+        if (pos < 0) pos = 0;
+        if (pos > totalLen) pos = totalLen;
 
         // Find element
         let elemIdx = -1;
@@ -355,10 +451,22 @@ class BeamFEM {
         const dofI = elemIdx * 2;
         const dofJ = (elemIdx + 1) * 2;
 
-        F[dofI] -= mag * N1 * 1000;
-        F[dofI + 1] -= mag * N2 * 1000;
-        F[dofJ] -= mag * N3 * 1000;
-        F[dofJ + 1] -= mag * N4 * 1000;
+        const f0 = -mag * N1 * 1000;
+        const f1 = -mag * N2 * 1000;
+        const f2 = -mag * N3 * 1000;
+        const f3 = -mag * N4 * 1000;
+
+        F[dofI] += f0;
+        F[dofI + 1] += f1;
+        F[dofJ] += f2;
+        F[dofJ + 1] += f3;
+
+        if (elemLoads && elemLoads[elemIdx]) {
+            elemLoads[elemIdx][0] += f0;
+            elemLoads[elemIdx][1] += f1;
+            elemLoads[elemIdx][2] += f2;
+            elemLoads[elemIdx][3] += f3;
+        }
     }
 
     private calculateForces(
@@ -371,7 +479,8 @@ class BeamFEM {
         F: number[],
         _constrained: boolean[],
         nElemsPerSpan: number,
-        numSpans: number
+        numSpans: number,
+        elemLoads?: number[][]
     ) {
         const v: number[] = [];
         const m: number[] = Array(nElems + 1).fill(0);
@@ -395,6 +504,9 @@ class BeamFEM {
             for (let r = 0; r < 4; r++) {
                 for (let c = 0; c < 4; c++) {
                     f_loc[r] += k_loc[r][c] * coeff * u_loc[c];
+                }
+                if (elemLoads && elemLoads[e]) {
+                    f_loc[r] -= elemLoads[e][r];
                 }
             }
             elemForces.push(f_loc);
@@ -483,7 +595,6 @@ const EnvelopeChart = ({
     title,
     unit,
     color,
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     flipY = false
 }: {
     data: any[],
@@ -498,6 +609,12 @@ const EnvelopeChart = ({
     const [width, setWidth] = useState(600);
     const height = 300;
     const padding = { top: 40, right: 30, bottom: 50, left: 70 };
+    const [hoverData, setHoverData] = useState<{
+        x: number;
+        svgX: number;
+        max: number;
+        min: number;
+    } | null>(null);
 
     useEffect(() => {
         if (containerRef.current) setWidth(containerRef.current.clientWidth);
@@ -518,6 +635,26 @@ const EnvelopeChart = ({
     let yMin = Math.min(...allY);
     let yMax = Math.max(...allY);
 
+    // Find global extrema
+    let globalMaxVal = -Infinity;
+    let globalMaxX = xMin;
+    let globalMinVal = Infinity;
+    let globalMinX = xMin;
+
+    for (let i = 0; i < data.length; i++) {
+        const pt = data[i];
+        const curMax = pt[dataKeyMax];
+        const curMin = pt[dataKeyMin];
+        if (curMax > globalMaxVal) {
+            globalMaxVal = curMax;
+            globalMaxX = pt.x;
+        }
+        if (curMin < globalMinVal) {
+            globalMinVal = curMin;
+            globalMinX = pt.x;
+        }
+    }
+
     const yRange = yMax - yMin;
     if (yRange === 0) { yMax += 1; yMin -= 1; }
     else { yMax += yRange * 0.1; yMin -= yRange * 0.1; }
@@ -526,7 +663,10 @@ const EnvelopeChart = ({
     const yTicks = calculateTicks(yMin, yMax, 6);
 
     const xScale = (val: number) => padding.left + ((val - xMin) / (xMax - xMin)) * (width - padding.left - padding.right);
-    const yScale = (val: number) => height - padding.bottom - ((val - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom);
+    const yScale = (val: number) =>
+        flipY
+            ? padding.top + ((val - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom)
+            : height - padding.bottom - ((val - yMin) / (yMax - yMin)) * (height - padding.top - padding.bottom);
 
     const createPath = (vals: number[]) => {
         return vals.map((y, i) => `${i === 0 ? 'M' : 'L'} ${xScale(data[i].x)} ${yScale(y)}`).join(' ');
@@ -540,10 +680,119 @@ const EnvelopeChart = ({
 
     const zeroY = yScale(0);
 
+    const unitSymbol = unit.includes('(') ? unit.split('(')[1].replace(')', '') : unit;
+
+    const formatVal = (val: number) => {
+        if (!Number.isFinite(val)) return '0.00';
+        if (Math.abs(val) < 1e-6) return '0.00';
+        if (Math.abs(val) < 0.005) return val.toFixed(4);
+        return val.toFixed(2);
+    };
+
+    const formatValWithDetail = (val: number) => {
+        if (!Number.isFinite(val)) return '0.00 ' + unitSymbol;
+        if (unitSymbol.toLowerCase() === 'm') {
+            const mm = (val * 1000).toFixed(2);
+            return `${val.toFixed(4)} m (${mm} mm)`;
+        }
+        return `${formatVal(val)} ${unitSymbol}`;
+    };
+
+    const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
+        const svgRect = e.currentTarget.getBoundingClientRect();
+        if (svgRect.width <= 0) return;
+        const clientX = e.clientX - svgRect.left;
+        const plotWidth = width - padding.left - padding.right;
+        if (plotWidth <= 0) return;
+
+        const rawRatio = (clientX - padding.left) / plotWidth;
+        const clampedRatio = Math.max(0, Math.min(1, rawRatio));
+        const targetX = xMin + clampedRatio * (xMax - xMin);
+
+        // Find interpolated values or nearest segment
+        let bestMax = 0;
+        let bestMin = 0;
+        let found = false;
+
+        for (let i = 0; i < data.length - 1; i++) {
+            const x1 = data[i].x;
+            const x2 = data[i + 1].x;
+            if (x1 === x2) continue; // vertical step boundary in stepped shear
+            const minSegX = Math.min(x1, x2);
+            const maxSegX = Math.max(x1, x2);
+            if (targetX >= minSegX && targetX <= maxSegX) {
+                const t = (targetX - x1) / (x2 - x1);
+                bestMax = data[i][dataKeyMax] + t * (data[i + 1][dataKeyMax] - data[i][dataKeyMax]);
+                bestMin = data[i][dataKeyMin] + t * (data[i + 1][dataKeyMin] - data[i][dataKeyMin]);
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            let nearestDist = Infinity;
+            let nearestIdx = 0;
+            for (let i = 0; i < data.length; i++) {
+                const dist = Math.abs(data[i].x - targetX);
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearestIdx = i;
+                }
+            }
+            bestMax = data[nearestIdx][dataKeyMax];
+            bestMin = data[nearestIdx][dataKeyMin];
+        }
+
+        const currentSvgX = xScale(targetX);
+        setHoverData({
+            x: targetX,
+            svgX: currentSvgX,
+            max: bestMax,
+            min: bestMin
+        });
+    };
+
+    const handlePointerLeave = () => {
+        setHoverData(null);
+    };
+
+    const tooltipWidth = 205;
+    const tooltipHeight = 68;
+    const tooltipX = hoverData
+        ? hoverData.svgX > width - tooltipWidth - 20
+            ? Math.max(padding.left + 5, hoverData.svgX - tooltipWidth - 12)
+            : Math.min(width - padding.right - tooltipWidth - 5, hoverData.svgX + 12)
+        : 0;
+    const tooltipY = Math.max(
+        padding.top + 6,
+        Math.min(height - padding.bottom - tooltipHeight - 6, padding.top + 8)
+    );
+
     return (
         <div ref={containerRef} className="w-full bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" >
-            <h3 className="text-lg font-semibold text-gray-800 mb-2" > {title} </h3>
-            < svg width={width} height={height} className="overflow-visible" >
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <h3 className="text-lg font-semibold text-gray-800">{title}</h3>
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-50 border border-blue-200 text-blue-800">
+                        <span className="font-medium text-gray-500">Max:</span>
+                        <span className="font-bold font-mono">{formatVal(globalMaxVal)} {unitSymbol}</span>
+                        <span className="text-gray-500">@ {globalMaxX.toFixed(2)}m</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-50 border border-red-200 text-red-800">
+                        <span className="font-medium text-gray-500">Min:</span>
+                        <span className="font-bold font-mono">{formatVal(globalMinVal)} {unitSymbol}</span>
+                        <span className="text-gray-500">@ {globalMinX.toFixed(2)}m</span>
+                    </div>
+                </div>
+            </div>
+
+            <svg
+                width={width}
+                height={height}
+                className="overflow-visible select-none"
+                onPointerMove={handlePointerMove}
+                onPointerLeave={handlePointerLeave}
+            >
 
                 {/* X-Grid & Labels */}
                 {
@@ -590,7 +839,7 @@ const EnvelopeChart = ({
                     Length(m)
                 </text>
 
-                < text
+                <text
                     x={15}
                     y={padding.top + (height - padding.top - padding.bottom) / 2}
                     textAnchor="middle"
@@ -603,12 +852,99 @@ const EnvelopeChart = ({
                     {unit}
                 </text>
 
-                < path d={pathFill} fill={color} fillOpacity="0.1" />
+                <path d={pathFill} fill={color} fillOpacity="0.1" />
                 <path d={pathMax} fill="none" stroke={color} strokeWidth="2" />
                 <path d={pathMin} fill="none" stroke="#ef4444" strokeWidth="2" strokeDasharray="4 2" />
 
+                {/* Extrema markers on the curves */}
+                {Number.isFinite(globalMaxVal) && (
+                    <circle
+                        cx={xScale(globalMaxX)}
+                        cy={yScale(globalMaxVal)}
+                        r="4.5"
+                        fill={color}
+                        stroke="#ffffff"
+                        strokeWidth="1.5"
+                    >
+                        <title>{`Max: ${formatVal(globalMaxVal)} ${unitSymbol} at x = ${globalMaxX.toFixed(2)} m`}</title>
+                    </circle>
+                )}
+                {Number.isFinite(globalMinVal) && (
+                    <circle
+                        cx={xScale(globalMinX)}
+                        cy={yScale(globalMinVal)}
+                        r="4.5"
+                        fill="#ef4444"
+                        stroke="#ffffff"
+                        strokeWidth="1.5"
+                    >
+                        <title>{`Min: ${formatVal(globalMinVal)} ${unitSymbol} at x = ${globalMinX.toFixed(2)} m`}</title>
+                    </circle>
+                )}
+
+                {/* Dynamic Cursor Overlay */}
+                {hoverData && (
+                    <g pointerEvents="none">
+                        <line
+                            x1={hoverData.svgX}
+                            y1={padding.top}
+                            x2={hoverData.svgX}
+                            y2={height - padding.bottom}
+                            stroke="#475569"
+                            strokeWidth="1.2"
+                            strokeDasharray="3 3"
+                        />
+                        <circle
+                            cx={hoverData.svgX}
+                            cy={yScale(hoverData.max)}
+                            r="4.5"
+                            fill={color}
+                            stroke="#ffffff"
+                            strokeWidth="2"
+                        />
+                        <circle
+                            cx={hoverData.svgX}
+                            cy={yScale(hoverData.min)}
+                            r="4.5"
+                            fill="#ef4444"
+                            stroke="#ffffff"
+                            strokeWidth="2"
+                        />
+
+                        {/* Tooltip Card */}
+                        <rect
+                            x={tooltipX}
+                            y={tooltipY}
+                            width={tooltipWidth}
+                            height={tooltipHeight}
+                            rx="6"
+                            fill="#0f172a"
+                            opacity="0.94"
+                        />
+                        <text x={tooltipX + 10} y={tooltipY + 18} fill="#f8fafc" fontSize="11" fontWeight="700">
+                            x = {hoverData.x.toFixed(2)} m
+                        </text>
+                        <text x={tooltipX + 10} y={tooltipY + 36} fill="#60a5fa" fontSize="10" fontWeight="500">
+                            Max: {formatValWithDetail(hoverData.max)}
+                        </text>
+                        <text x={tooltipX + 10} y={tooltipY + 54} fill="#f87171" fontSize="10" fontWeight="500">
+                            Min: {formatValWithDetail(hoverData.min)}
+                        </text>
+                    </g>
+                )}
+
+                {/* Interactive Overlay Layer */}
+                <rect
+                    x={padding.left}
+                    y={padding.top}
+                    width={width - padding.left - padding.right}
+                    height={height - padding.top - padding.bottom}
+                    fill="transparent"
+                    className="cursor-crosshair"
+                />
+
             </svg>
-            < div className="flex justify-center gap-6 mt-2 text-sm" >
+            <div className="flex justify-center gap-6 mt-2 text-sm" >
                 <div className="flex items-center" > <div className="w-4 h-0.5 bg-[color:var(--color)] mr-2" style={{ backgroundColor: color }}> </div> Max Envelope</div >
                 <div className="flex items-center" > <div className="w-4 h-0.5 bg-red-500 mr-2 border-dashed border-t-2 border-red-500" > </div> Min Envelope</div >
             </div>
@@ -751,11 +1087,13 @@ const BeamSchematic = ({ spans }: { spans: Span[] }) => {
 const BeamReactionDiagram = ({
     spans,
     reactions,
-    supportPositions
+    supportPositions,
+    dla
 }: {
     spans: Span[],
     reactions: ReactionEnvelope[],
-    supportPositions: number[]
+    supportPositions: number[],
+    dla?: number
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const [width, setWidth] = useState(600);
@@ -908,11 +1246,45 @@ const BeamReactionDiagram = ({
                 )}
             </svg>
             <div className="flex justify-center gap-4 mt-1 text-xs text-gray-500">
-                <span>↑ Maximum reaction forces shown</span>
+                <span>↑ Maximum reaction forces shown{dla !== undefined ? ` (Applied DLA = ${(dla * 100).toFixed(0)}%)` : ''}</span>
             </div>
         </div>
     );
 };
+
+// Helper to calculate automated DLA based on CSA S6-19 Cl. 3.8.4.5 and span arrangement
+export function computeAutoDlaInfo(spans: Span[], axles: Axle[]): {
+    dla: number;
+    axleCount: number;
+    maxSpan: number;
+    desc: string;
+} {
+    const maxSpan = Math.max(...spans.map(s => s.length), 0);
+    let maxAxlesOnSpan = 1;
+    for (let i = 0; i < axles.length; i++) {
+        let count = 1;
+        let cumulativeDist = 0;
+        for (let j = i; j < axles.length - 1; j++) {
+            cumulativeDist += axles[j].spacing;
+            if (cumulativeDist <= maxSpan + 0.000001) {
+                count++;
+            } else {
+                break;
+            }
+        }
+        if (count > maxAxlesOnSpan) maxAxlesOnSpan = count;
+    }
+    let dla = 0.25;
+    let desc = '≥ 3 axles on span';
+    if (maxAxlesOnSpan <= 1) {
+        dla = 0.40;
+        desc = '1 axle on span';
+    } else if (maxAxlesOnSpan === 2) {
+        dla = 0.30;
+        desc = '2 axles on span (tandem)';
+    }
+    return { dla, axleCount: maxAxlesOnSpan, maxSpan, desc };
+}
 
 export default function BeamAnalysisApp() {
     const [spans, setSpans] = useState<Span[]>(DEFAULT_SPANS);
@@ -921,6 +1293,8 @@ export default function BeamAnalysisApp() {
     const [results, setResults] = useState<AnalysisResults | null>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [activeTab, setActiveTab] = useState<'config' | 'results'>('config');
+
+    const autoDlaInfo = useMemo(() => computeAutoDlaInfo(spans, axles), [spans, axles]);
 
     // Inject SheetJS script for Excel Export
     useEffect(() => {
@@ -1104,6 +1478,70 @@ export default function BeamAnalysisApp() {
                                                 </select>
                                             </div>
 
+                                            <div>
+                                                <div className="flex items-center justify-between mb-1.5">
+                                                    <label className="block text-sm font-medium text-gray-700">
+                                                        Dynamic Load Allowance (DLA)
+                                                    </label>
+                                                    <label className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer select-none">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={config.dlaOverride !== null && config.dlaOverride !== undefined}
+                                                            onChange={(e) => {
+                                                                const checked = e.target.checked;
+                                                                setConfig({
+                                                                    ...config,
+                                                                    dlaOverride: checked ? (config.dlaOverride ?? autoDlaInfo.dla) : null,
+                                                                });
+                                                            }}
+                                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5 cursor-pointer"
+                                                        />
+                                                        <span className="font-medium">Override DLA</span>
+                                                    </label>
+                                                </div>
+
+                                                {config.dlaOverride === null || config.dlaOverride === undefined ? (
+                                                    <div className="bg-slate-50 border border-slate-200 rounded p-2.5 flex items-center justify-between">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-blue-100 text-blue-800">
+                                                                Auto: {(autoDlaInfo.dla * 100).toFixed(0)}% (DLA = {autoDlaInfo.dla.toFixed(2)})
+                                                            </span>
+                                                            <span className="text-xs text-slate-600">
+                                                                {autoDlaInfo.desc} (L<sub>max</sub> = {autoDlaInfo.maxSpan.toFixed(2)}m)
+                                                            </span>
+                                                        </div>
+                                                        <span className="text-[10px] text-slate-400 font-medium">CSA S6 Cl. 3.8.4.5</span>
+                                                    </div>
+                                                ) : (
+                                                    <div className="space-y-1.5">
+                                                        <div className="flex items-center gap-2">
+                                                            <input
+                                                                type="number"
+                                                                step="0.01"
+                                                                min="0"
+                                                                max="1.0"
+                                                                value={config.dlaOverride}
+                                                                onChange={(e) => {
+                                                                    const val = parseFloat(e.target.value);
+                                                                    setConfig({
+                                                                        ...config,
+                                                                        dlaOverride: isNaN(val) ? 0 : val,
+                                                                    });
+                                                                }}
+                                                                className="w-1/3 bg-white border border-blue-400 rounded px-2.5 py-1 text-sm focus:ring-2 focus:ring-blue-500 outline-none font-semibold text-blue-900"
+                                                                placeholder="e.g. 0.30"
+                                                            />
+                                                            <span className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2.5 py-1">
+                                                                Manual override active: <strong>{((config.dlaOverride ?? 0) * 100).toFixed(1)}%</strong>
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                <span className="text-[11px] text-gray-500 mt-1 block">
+                                                    Automated per CSA S6 Cl. 3.8.4.5 based on span arrangement and axles on span (40% for 1 axle, 30% for 2-axle tandem, 25% for ≥ 3 axles).
+                                                </span>
+                                            </div>
+
                                             < div className="grid grid-cols-2 gap-4" >
                                                 <div>
                                                     <label className="block text-sm font-medium text-gray-700 mb-1" > Elastic Modulus(Pa) </label>
@@ -1164,6 +1602,7 @@ export default function BeamAnalysisApp() {
                                 spans={spans}
                                 reactions={results.reactions}
                                 supportPositions={results.supportPositions}
+                                dla={results.dlaUsed}
                             />
                             <EnvelopeChart
                                 title="Shear Force Envelope"

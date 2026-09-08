@@ -6,7 +6,9 @@
         "ll-analyzer"
     ],
     "scripts": {
-        "build": "npm run build --workspace=ll-analyzer",
+        "build": "node build-standalone.mjs",
+        "build:standalone": "node build-standalone.mjs",
+        "start": "node build-standalone.mjs",
         "dev": "npm run dev --workspace=ll-analyzer",
         "lint": "npm run lint --workspace=ll-analyzer"
     }
