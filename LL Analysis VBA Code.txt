@@ -3,21 +3,28 @@ Option Explicit
 ' ==============================================================================
 ' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 TRUCK)
 ' Fixes: Variable Spans, Error Handling, Stepped Shear, Support Reaction Diagrams
+' App parity: patterned lane UDL, lane truck DLA (0.8*(1+DLA)), per-span conservative
+' auto-DLA, adaptive sweep step, upward-positive reactions
 ' ==============================================================================
 
 ' Analysis resolution. These defaults are overridden by the Inputs sheet (cells H2 / H3).
+' TRUCK_INCREMENT (H3) is the BASE step; the effective sweep step is auto-refined
+' to match the app (TypeScript computeEffectiveIncrement parity - see ComputeEffectiveIncrement).
 Const DEF_N_ELEMS_PER_SPAN As Long = 40    ' Elements per span
-Const DEF_TRUCK_INCREMENT As Double = 0.25 ' Moving step (meters)
+Const DEF_TRUCK_INCREMENT As Double = 0.25 ' Base moving step (meters)
 Const MAX_AXLES As Long = 20               ' Upper bound when scanning column D for axles
 Const MAX_PATTERN_SPANS As Long = 12       ' 2^n UDL patterns becomes prohibitive beyond this
+Const MIN_SWEEP_STEP As Double = 0.02      ' Floor so tiny spans cannot cause a runaway solve count
+Const MAX_SWEEP_STEPS As Long = 6000       ' Cap on uniform sweep steps per pass (app parity)
 
 ' Live load factors
 Const DLA_FACTOR As Double = 0.25          ' Dynamic load allowance applied to the truck-only case
-Const LANE_TRUCK_FACTOR As Double = 0.8    ' Truck portion of the lane load
+Const LANE_TRUCK_FACTOR As Double = 0.8    ' Truck portion of the lane load (before DLA - app parity: 0.8 * (1 + DLA))
 Const LANE_UDL As Double = 9               ' Lane UDL (kN/m)
 
 Private N_ELEMS_PER_SPAN As Long
-Private TRUCK_INCREMENT As Double
+Private TRUCK_INCREMENT As Double          ' Base step from Inputs H3
+Private EFF_TRUCK_INCREMENT As Double      ' Effective sweep step actually used (auto-refined)
 
 ' Cached LU factorisation of the reduced stiffness matrix. K does not change while the
 ' truck moves, so it is factorised once and re-used for every load position.
@@ -223,11 +230,10 @@ Sub MainAnalysis()
     
     ' Dynamic Load Allowance (DLA):
     ' If cell H4 contains a user override >= 0, use it.
-    ' Otherwise, dynamically calculate DLA per CSA S6 Cl. 3.8.4.5 based on span arrangement
-    ' and the maximum number of axles that can simultaneously fit on any span:
-    ' - 1 axle on span (L < 1.2m): 0.40 (40%)
-    ' - 2 axles on span (L < 4.8m): 0.30 (30%)
-    ' - 3 or more axles on span (L >= 4.8m): 0.25 (25%)
+    ' Otherwise, dynamically calculate DLA per CSA S6 Cl. 3.8.4.5.
+    ' App parity (TS calculateAutoDla / computeAutoDlaInfo): evaluate EVERY span and
+    ' govern with the highest DLA - using only the longest span under-applies DLA
+    ' to short spans. Axle-count rule: 1 axle = 0.40, 2 axles = 0.30, 3+ = 0.25.
     Dim DLA_Val As Double
     Dim isDlaOverridden As Boolean
     isDlaOverridden = False
@@ -240,21 +246,19 @@ Sub MainAnalysis()
     End If
     
     If Not isDlaOverridden Then
-        Dim maxSpanLen As Double: maxSpanLen = 0#
-        For i = 0 To numSpans - 1
-            If spanLengths(i) > maxSpanLen Then maxSpanLen = spanLengths(i)
-        Next i
-        
-        Dim maxAxlesOnSpan As Long
-        maxAxlesOnSpan = CalculateMaxAxlesOnSpan(maxSpanLen, spacings, nAxles)
-        
-        If maxAxlesOnSpan <= 1 Then
-            DLA_Val = 0.4#
-        ElseIf maxAxlesOnSpan = 2 Then
-            DLA_Val = 0.3#
-        Else
-            DLA_Val = 0.25#
-        End If
+        Dim sDla As Long, nOnSpan As Long, dForSpan As Double
+        DLA_Val = 0.25#
+        For sDla = 0 To numSpans - 1
+            nOnSpan = CalculateMaxAxlesOnSpan(spanLengths(sDla), spacings, nAxles)
+            If nOnSpan <= 1 Then
+                dForSpan = 0.4#
+            ElseIf nOnSpan = 2 Then
+                dForSpan = 0.3#
+            Else
+                dForSpan = 0.25#
+            End If
+            If dForSpan > DLA_Val Then DLA_Val = dForSpan
+        Next sDla
     End If
     
     Application.ScreenUpdating = False
@@ -336,24 +340,38 @@ Sub MainAnalysis()
         supportX(i + 1) = xNodes(nodeIdx)
     Next i
     
-    ' --- 4b. TRUCK MOVEMENT DISCRETISATION ---
+    ' --- 4b. TRUCK MOVEMENT DISCRETISATION (app parity: adaptive sweep step) ---
+    ' A fixed 0.25 m step jumps over entire elements on short spans and misses peaks.
+    ' Effective step = min(base, minSpan/40, minElemLen, minAxleSpacing/8), floored at
+    ' MIN_SWEEP_STEP and capped so uniform steps stay <= MAX_SWEEP_STEPS (TS parity).
     Dim truckLen As Double
     truckLen = 0#
     For j = 0 To nAxles - 2: truckLen = truckLen + spacings(j): Next j
+    
+    EFF_TRUCK_INCREMENT = ComputeEffectiveIncrement(TRUCK_INCREMENT, spanLengths, numSpans, _
+                                                    spacings, nAxles, truckLen, totalLength, _
+                                                    N_ELEMS_PER_SPAN)
     
     Dim startPos As Double, endPos As Double
     startPos = -truckLen
     endPos = totalLength + truckLen
     
     Dim nTruckSteps As Long
-    nTruckSteps = CLng(Int((endPos - startPos) / TRUCK_INCREMENT + 0.000001)) + 1
+    nTruckSteps = CLng(Int((endPos - startPos) / EFF_TRUCK_INCREMENT + 0.000001)) + 1
+    If nTruckSteps < 2 Then nTruckSteps = 2
     
     Dim xTruckSteps() As Double
     ReDim xTruckSteps(nTruckSteps - 1)
     Dim sStep As Long
     For sStep = 0 To nTruckSteps - 1
-        xTruckSteps(sStep) = startPos + sStep * TRUCK_INCREMENT
+        xTruckSteps(sStep) = startPos + sStep * EFF_TRUCK_INCREMENT
     Next sStep
+    ' Guarantee the tail position is represented when the sweep is not an exact multiple
+    If Abs(xTruckSteps(nTruckSteps - 1) - endPos) > 0.000001 Then
+        If endPos - xTruckSteps(nTruckSteps - 1) < EFF_TRUCK_INCREMENT Then
+            xTruckSteps(nTruckSteps - 1) = endPos
+        End If
+    End If
     
     ' --- 4c. FACTORISE ONCE ---
     ' K is identical for every truck position, so the expensive elimination is done once
@@ -394,7 +412,12 @@ Sub MainAnalysis()
     End If
     
     If loadCase = 2 Or loadCase = 3 Then
-        RunLoadCaseEnvelope "Lane", LANE_TRUCK_FACTOR, LANE_UDL, axles, spacings, nAxles, _
+        ' App parity (TS laneAxles): the 0.8 truck portion of lane load CARRIES DLA per
+        ' CSA S6-19 3.8.4.5 - the UDL does not. Old VBA passed 0.8 alone and under-predicted
+        ' lane reactions/shear/moment by (1 + DLA).
+        Dim laneAxleFactor As Double
+        laneAxleFactor = LANE_TRUCK_FACTOR * (1# + DLA_Val)
+        RunLoadCaseEnvelope "Lane", laneAxleFactor, LANE_UDL, axles, spacings, nAxles, _
                             numSpans, spanLengths, totalLength, _
                             nTotalElems, elemLens, nDOF, nNodes, nShearPoints, E_Val, I_Val, _
                             K_Global, supportDOFs, nSupports, supportX, xTruckSteps, nTruckSteps, _
@@ -458,7 +481,12 @@ Sub MainAnalysis()
     Application.StatusBar = False
     Application.ScreenUpdating = True
     Application.Calculation = xlCalculationAutomatic
-    MsgBox "Analysis Complete!", vbInformation
+    If Abs(EFF_TRUCK_INCREMENT - TRUCK_INCREMENT) > 0.0000001 Then
+        MsgBox "Analysis Complete!" & vbCrLf & "Sweep step used: " & Format(EFF_TRUCK_INCREMENT, "0.000") & _
+               "m (auto-refined from base " & Format(TRUCK_INCREMENT, "0.000") & "m).", vbInformation
+    Else
+        MsgBox "Analysis Complete!", vbInformation
+    End If
     Exit Sub
 
 CleanFail:
@@ -474,7 +502,8 @@ End Sub
 ' ==============================================================================
 
 ' Builds the shear / moment / deflection / reaction envelope for one live load configuration.
-' axleFactor scales the base axle loads (1 + DLA for the truck case, 0.8 for the lane case)
+' axleFactor scales the base axle loads (1 + DLA for the truck case, 0.8 * (1 + DLA)
+' for the lane case per CSA S6-19 3.8.4.5 - UDL carries no DLA)
 ' and w_udl > 0 adds the patterned lane UDL. The eight output arrays are re-dimensioned here.
 Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, w_udl As Double, _
                         baseAxles() As Double, spacings() As Double, nAxles As Long, _
@@ -694,8 +723,8 @@ Sub RunTruckPass(caseLabel As String, _
                         If v_tgt < MinV(i) Then MinV(i) = v_tgt
                     Next i
                     
-                    ' Associate with closest step index in reaction diagram
-                    bestStepIdx = CLng(Round((alignLeadPos - xTruckSteps(0)) / TRUCK_INCREMENT))
+                    ' Associate with closest step index in reaction diagram (effective-step parity)
+                    bestStepIdx = CLng(Round((alignLeadPos - xTruckSteps(0)) / EFF_TRUCK_INCREMENT))
                     If bestStepIdx < 0 Then bestStepIdx = 0
                     If bestStepIdx > nTruckSteps - 1 Then bestStepIdx = nTruckSteps - 1
                     For s = 0 To nSupports - 1
@@ -943,6 +972,57 @@ Sub ComputeSupportSummary(MaxR() As Double, MinR() As Double, xTruck() As Double
 End Sub
 
 ' --- UTILITY FUNCTIONS ---
+
+' Adaptive sweep step - TypeScript computeEffectiveIncrement parity.
+' Effective = min(base, minSpan/40, minElemLen, minAxleSpacing/8), floored at
+' MIN_SWEEP_STEP, capped so uniform steps <= MAX_SWEEP_STEPS, rounded UP to 5 mm.
+' Support alignments are always added explicitly, so support peaks stay exact.
+Function ComputeEffectiveIncrement(baseInc As Double, spanLengths() As Double, numSpans As Long, _
+                                   spacings() As Double, nAxles As Long, _
+                                   truckLen As Double, totalLength As Double, _
+                                   nElemsPerSpan As Long) As Double
+    Dim i As Long
+    Dim minSpan As Double: minSpan = 1E+30
+    For i = 0 To numSpans - 1
+        If spanLengths(i) > 0 And spanLengths(i) < minSpan Then minSpan = spanLengths(i)
+    Next i
+    If minSpan > 1E+29 Or baseInc <= 0 Then
+        ComputeEffectiveIncrement = baseInc
+        Exit Function
+    End If
+    
+    Dim denom As Long: denom = nElemsPerSpan
+    If denom < 2 Then denom = 2
+    Dim minElem As Double: minElem = minSpan / denom
+    
+    Dim minGap As Double: minGap = 1E+30
+    For i = 0 To nAxles - 2
+        If spacings(i) > 0 And spacings(i) < minGap Then minGap = spacings(i)
+    Next i
+    
+    Dim eff As Double: eff = baseInc
+    Dim cand As Double
+    cand = minSpan / 40#
+    If cand > 0 And cand < eff Then eff = cand
+    cand = minElem
+    If cand > 0 And cand < eff Then eff = cand
+    If minGap < 1E+29 Then
+        cand = minGap / 8#
+        If cand > 0 And cand < eff Then eff = cand
+    End If
+    
+    If eff < MIN_SWEEP_STEP Then eff = MIN_SWEEP_STEP
+    
+    Dim sweepLen As Double: sweepLen = totalLength + 2# * truckLen
+    If sweepLen / eff > MAX_SWEEP_STEPS Then eff = sweepLen / MAX_SWEEP_STEPS
+    
+    ' Round UP to 5 mm (ceil to 1/200 m); rounding up never refines beyond need
+    eff = -Int(-eff * 200#) / 200#
+    If eff > baseInc Then eff = baseInc
+    If eff <= 0 Then eff = baseInc
+    
+    ComputeEffectiveIncrement = eff
+End Function
 
 ' Calculates maximum number of consecutive axles that can simultaneously fit on any span of length maxSpan.
 Function CalculateMaxAxlesOnSpan(maxSpan As Double, spacings() As Double, nAxles As Long) As Long
@@ -1252,9 +1332,15 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
     ws.Cells(3, colShear).Resize(nS + 1, 3).Value = dataS
     ws.Cells(3, colShear).Resize(nS + 1, 3).NumberFormat = "0.00"
     
-    ' 3. Support Reactions Summary
+    ' 3. Support Reactions Summary (app parity: show effective sweep step alongside DLA)
     Dim colSupp As Long: colSupp = col0 + 10
-    ws.Cells(1, colSupp).Value = UCase(label) & " - SUPPORT REACTIONS SUMMARY (DLA = " & Format(DLA_Val * 100, "0.0") & "%" & IIf(isDlaOverridden, " OVERRIDE", " AUTO") & ")"
+    Dim stepNote As String
+    If Abs(EFF_TRUCK_INCREMENT - TRUCK_INCREMENT) > 0.0000001 Then
+        stepNote = "; step " & Format(EFF_TRUCK_INCREMENT, "0.000") & "m (auto-refined from " & Format(TRUCK_INCREMENT, "0.000") & "m)"
+    Else
+        stepNote = "; step " & Format(EFF_TRUCK_INCREMENT, "0.000") & "m"
+    End If
+    ws.Cells(1, colSupp).Value = UCase(label) & " - SUPPORT REACTIONS SUMMARY (DLA = " & Format(DLA_Val * 100, "0.0") & "%" & IIf(isDlaOverridden, " OVERRIDE", " AUTO") & stepNote & ")"
     ws.Cells(1, colSupp).Font.Bold = True
     ws.Cells(2, colSupp).Resize(1, 5).Value = Array("Support", "Location (m)", "Max Reaction (kN)", "Min Reaction (kN)", "Gov Truck Pos (m)")
     ws.Cells(2, colSupp).Resize(1, 5).Font.Bold = True
