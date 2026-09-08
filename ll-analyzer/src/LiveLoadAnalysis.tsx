@@ -478,10 +478,10 @@ class BeamFEM {
             return { shear, moment, deflect, react };
         };
 
-        // DLA applies to axle loads (including the 0.8 truck portion of lane load per
-        // CSA S6-19 3.8.4.5 - truck portion carries DLA, UDL does not).
+        // DLA applies to truck-only axle loads. Lane load carries NO DLA
+        // (neither the 0.8 truck portion nor the UDL).
         const truckAxles = baseAxles.map(a => ({ ...a, load: a.load * (1 + dla) }));
-        const laneAxles = baseAxles.map(a => ({ ...a, load: a.load * 0.8 * (1 + dla) }));
+        const laneAxles = baseAxles.map(a => ({ ...a, load: a.load * 0.8 }));
         const LANE_UDL = 9; // kN/m
 
         if (loadCase === 'truck') {
@@ -490,7 +490,7 @@ class BeamFEM {
         }
         if (loadCase === 'lane') {
             const r = runSingleCase(laneAxles, LANE_UDL);
-            return { shear: r.shear, moment: r.moment, deflection: r.deflect, xNodes, reactions: r.react, supportPositions, dlaUsed: dla, incrementUsed: step, baseIncrement: truckIncrement };
+            return { shear: r.shear, moment: r.moment, deflection: r.deflect, xNodes, reactions: r.react, supportPositions, dlaUsed: 0, incrementUsed: step, baseIncrement: truckIncrement };
         }
         // envelope: governing of truck-only and lane cases
         const t = runSingleCase(truckAxles, 0);
@@ -1586,7 +1586,7 @@ export default function BeamAnalysisApp() {
                                                     className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
                                                 >
                                                     <option value="truck" > CL-625 Truck Only (Standard) </option>
-                                                    <option value="lane" > CL-625 Lane Load (80% Truck with DLA + 9 kN/m patterned) </option>
+                                                    <option value="lane" > CL-625 Lane Load (80% Truck, no DLA + 9 kN/m patterned) </option>
                                                     <option value="envelope" > Envelope (max of Truck and Lane) </option>
                                                 </select>
                                             </div>
@@ -1652,6 +1652,7 @@ export default function BeamAnalysisApp() {
                                                 )}
                                                 <span className="text-[11px] text-gray-500 mt-1 block">
                                                     Automated per CSA S6 Cl. 3.8.4.5 based on span arrangement and axles on span (40% for 1 axle, 30% for 2-axle tandem, 25% for ≥ 3 axles).
+                                                    Applies to truck-only loads; lane load uses no DLA.
                                                 </span>
                                             </div>
 

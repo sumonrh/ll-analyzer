@@ -3,8 +3,8 @@ Option Explicit
 ' ==============================================================================
 ' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 TRUCK)
 ' Fixes: Variable Spans, Error Handling, Stepped Shear, Support Reaction Diagrams
-' App parity: patterned lane UDL, lane truck DLA (0.8*(1+DLA)), per-span conservative
-' auto-DLA, adaptive sweep step, upward-positive reactions
+' App parity: patterned lane UDL, NO lane-load DLA, per-span conservative
+' auto-DLA (truck case), adaptive sweep step, upward-positive reactions
 ' ==============================================================================
 
 ' Analysis resolution. These defaults are overridden by the Inputs sheet (cells H2 / H3).
@@ -19,7 +19,7 @@ Const MAX_SWEEP_STEPS As Long = 6000       ' Cap on uniform sweep steps per pass
 
 ' Live load factors
 Const DLA_FACTOR As Double = 0.25          ' Dynamic load allowance applied to the truck-only case
-Const LANE_TRUCK_FACTOR As Double = 0.8    ' Truck portion of the lane load (before DLA - app parity: 0.8 * (1 + DLA))
+Const LANE_TRUCK_FACTOR As Double = 0.8    ' Truck portion of the lane load (no DLA)
 Const LANE_UDL As Double = 9               ' Lane UDL (kN/m)
 
 Private N_ELEMS_PER_SPAN As Long
@@ -412,11 +412,10 @@ Sub MainAnalysis()
     End If
     
     If loadCase = 2 Or loadCase = 3 Then
-        ' App parity (TS laneAxles): the 0.8 truck portion of lane load CARRIES DLA per
-        ' CSA S6-19 3.8.4.5 - the UDL does not. Old VBA passed 0.8 alone and under-predicted
-        ' lane reactions/shear/moment by (1 + DLA).
+        ' Lane load carries NO DLA (neither the 0.8 truck portion nor the UDL).
+        ' Truck-only case uses (1 + DLA); lane case uses plain 0.8.
         Dim laneAxleFactor As Double
-        laneAxleFactor = LANE_TRUCK_FACTOR * (1# + DLA_Val)
+        laneAxleFactor = LANE_TRUCK_FACTOR
         RunLoadCaseEnvelope "Lane", laneAxleFactor, LANE_UDL, axles, spacings, nAxles, _
                             numSpans, spanLengths, totalLength, _
                             nTotalElems, elemLens, nDOF, nNodes, nShearPoints, E_Val, I_Val, _
@@ -502,9 +501,9 @@ End Sub
 ' ==============================================================================
 
 ' Builds the shear / moment / deflection / reaction envelope for one live load configuration.
-' axleFactor scales the base axle loads (1 + DLA for the truck case, 0.8 * (1 + DLA)
-' for the lane case per CSA S6-19 3.8.4.5 - UDL carries no DLA)
-' and w_udl > 0 adds the patterned lane UDL. The eight output arrays are re-dimensioned here.
+' axleFactor scales the base axle loads (1 + DLA for the truck case, plain 0.8 with
+' NO DLA for the lane case) and w_udl > 0 adds the patterned lane UDL (no DLA).
+' The eight output arrays are re-dimensioned here.
 Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, w_udl As Double, _
                         baseAxles() As Double, spacings() As Double, nAxles As Long, _
                         numSpans As Long, spanLengths() As Double, totalLength As Double, _
@@ -1238,7 +1237,7 @@ Sub OutputResults(loadCase As Long, xNodes() As Double, xShear() As Double, _
                              xShear, LneMaxV, LneMinV, _
                              supportX, LneSuppMaxR, LneSuppMinR, LneSuppGovPos, _
                              xTruckSteps, LneMaxR, LneMinR, nSupports, nextCol, _
-                             DLA_Val, isDlaOverridden
+                             0#, False
             ws.Columns.AutoFit
             chartLeft = ws.Cells(1, nextCol).Left + 20
             CreateResultCharts ws, "Lane", 1, nSupports, supportX, _
@@ -1257,7 +1256,7 @@ Sub OutputResults(loadCase As Long, xNodes() As Double, xShear() As Double, _
                              xShear, LneMaxV, LneMinV, _
                              supportX, LneSuppMaxR, LneSuppMinR, LneSuppGovPos, _
                              xTruckSteps, LneMaxR, LneMinR, nSupports, col3, _
-                             DLA_Val, isDlaOverridden
+                             0#, False
             
             WriteResultBlock ws, col3, "Envelope", xNodes, EnvMaxM, EnvMinM, EnvMaxD, EnvMinD, _
                              xShear, EnvMaxV, EnvMinV, _
