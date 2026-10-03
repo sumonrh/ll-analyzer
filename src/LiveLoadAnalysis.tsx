@@ -604,12 +604,16 @@ const BeamReactionDiagram = ({
     spans,
     reactions,
     supportPositions,
-    dla
+    dla,
+    dlaAuto,
+    dlaMultiplier,
 }: {
     spans: Span[],
     reactions: ReactionEnvelope[],
     supportPositions: number[],
-    dla?: number
+    dla?: number,
+    dlaAuto?: boolean,
+    dlaMultiplier?: number,
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const [width, setWidth] = useState(600);
@@ -762,7 +766,7 @@ const BeamReactionDiagram = ({
                 )}
             </svg>
             <div className="flex justify-center gap-4 mt-1 text-xs text-gray-500">
-                <span>↑ Maximum reaction forces shown{dla !== undefined ? ` (Applied DLA = ${(dla * 100).toFixed(0)}%)` : ''}</span>
+                <span>↑ Maximum reaction forces shown{dlaAuto ? ` (Auto truck DLA 40%/30%/25% × d=${((dlaMultiplier ?? 1) * 100).toFixed(0)}%; support maxima are continuous optima)` : dla !== undefined ? ` (Applied DLA = ${(dla * 100).toFixed(0)}%)` : ''}</span>
             </div>
         </div>
     );
@@ -890,6 +894,8 @@ export default function BeamAnalysisApp() {
             'Elements per Span': results.config.nElemsPerSpan,
             'Elastic Modulus (Pa)': results.config.E,
             'Moment of Inertia (m^4)': results.config.I,
+            'DLA Multiplier d': results.config.dlaMultiplier ?? 1,
+            'Method': 'FEA + influence-line UDL zones + continuous truck optimisation (VBA parity)',
             'Elapsed (ms)': results.elapsedMs,
         }]);
         append('Spans', results.spans.map((span, i) => ({ 'Span': i + 1, 'Length (m)': span.length })));
@@ -907,6 +913,7 @@ export default function BeamAnalysisApp() {
                 'Support': `Support ${i + 1}`, 'Location (m)': r.x,
                 'Max Reaction (kN)': r.max, 'Min Reaction (kN)': r.min,
                 'Gov Truck Pos (m)': r.govPos, 'Applied DLA': data.dlaUsed,
+                'DLA Auto': data.dlaAuto, 'DLA Base': data.dlaBase, 'DLA Multiplier d': data.dlaMultiplier,
             })));
             append(`${name} Reaction Diagrams`, results.truckPositions.map((x, p) => {
                 const row: Record<string, number> = { 'Truck Position (m)': x };
@@ -1063,10 +1070,10 @@ export default function BeamAnalysisApp() {
                                                     <div className="bg-slate-50 border border-slate-200 rounded p-2.5 flex items-center justify-between">
                                                         <div className="flex items-center gap-2">
                                                             <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-blue-100 text-blue-800">
-                                                                Auto: {(autoDlaInfo.dla * 100).toFixed(0)}% (DLA = {autoDlaInfo.dla.toFixed(2)})
+                                                                Auto: 40%/30%/25% × d={(config.dlaMultiplier ?? 1).toFixed(2)}
                                                             </span>
                                                             <span className="text-xs text-slate-600">
-                                                                {autoDlaInfo.desc} (governing span = {autoDlaInfo.governingSpan.toFixed(2)}m)
+                                                                Span-based uniform ({autoDlaInfo.desc})
                                                             </span>
                                                         </div>
                                                         <span className="text-[10px] text-slate-400 font-medium">CSA S6 Cl. 3.8.4.5</span>
@@ -1097,9 +1104,36 @@ export default function BeamAnalysisApp() {
                                                     </div>
                                                 )}
                                                 <span className="text-[11px] text-gray-500 mt-1 block">
-                                                    Automated per CSA S6 Cl. 3.8.4.5 based on span arrangement and axles on span (40% for 1 axle, 30% for 2-axle tandem, 25% for ≥ 3 axles).
-                                                    Applies to truck-only loads; lane load uses no DLA.
+                                                    Automated per CSA S6 Cl. 3.8.4.5 with FEA + influence-line placement (verified vs Midas Civil).
+                                                    Uniform span-based DLA: 40% (1 axle), 30% (2 axles / tandem), 25% (≥3 axles), × d multiplier.
+                                                    Lane UDL (9 kN/m) uses exact positive/negative influence zones incl. partial elements, no DLA; lane truck uses 80% with no DLA.
                                                 </span>
+                                                <div className="mt-2">
+                                                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                                                        Truck DLA Multiplier, d (0–1)
+                                                    </label>
+                                                    <div className="flex items-center gap-2">
+                                                        <input
+                                                            type="number"
+                                                            step="0.01"
+                                                            min="0"
+                                                            max="1"
+                                                            value={config.dlaMultiplier ?? 1}
+                                                            onChange={(e) => {
+                                                                const val = parseFloat(e.target.value);
+                                                                setConfig({
+                                                                    ...config,
+                                                                    dlaMultiplier: isNaN(val) ? 1 : Math.max(0, Math.min(1, val)),
+                                                                });
+                                                            }}
+                                                            className="w-1/3 bg-white border border-gray-300 rounded px-2.5 py-1 text-sm focus:ring-2 focus:ring-blue-500 outline-none font-semibold"
+                                                            placeholder="e.g. 1.00"
+                                                        />
+                                                        <span className="text-xs text-gray-600">
+                                                            d=0 off, d=1 full, d=0.75 = 25% less. Applies to truck DLA (auto or override).
+                                                        </span>
+                                                    </div>
+                                                </div>
                                             </div>
 
                                             < div className="grid grid-cols-2 gap-4" >
@@ -1222,7 +1256,10 @@ export default function BeamAnalysisApp() {
                                     {results.baseIncrement !== undefined && Math.abs(results.incrementUsed - results.baseIncrement) > 1e-9
                                         ? <> (adjusted from base {results.baseIncrement.toFixed(3)}m: {results.incrementReason})</>
                                         : <> (base setting)</>}.
-                                    Exact axle/support alignment positions included. DLA applies only to the truck case.
+                                    Exact axle/support alignment positions included. Envelopes use continuous truck optimisation; UDL uses exact influence zones.
+                                    {displayed.dlaAuto
+                                        ? <> Truck DLA auto (span-based uniform): 40%/30%/25% × d={(displayed.dlaMultiplier ?? 1).toFixed(2)}.</>
+                                        : <> Truck DLA effective: {((displayed.dlaUsed ?? 0) * 100).toFixed(2)}%{resultCase !== 'lane' ? ` (base ${((displayed.dlaBase ?? 0) * 100).toFixed(2)}% × d=${(displayed.dlaMultiplier ?? 1).toFixed(2)})` : ' (lane: no DLA)' }.</>}
                                 </div>
                             )}
                             <BeamReactionDiagram
@@ -1230,6 +1267,8 @@ export default function BeamAnalysisApp() {
                                 reactions={displayed.reactions}
                                 supportPositions={results.supportPositions}
                                 dla={displayed.dlaUsed}
+                                dlaAuto={displayed.dlaAuto}
+                                dlaMultiplier={displayed.dlaMultiplier}
                             />
                             <EnvelopeChart
                                 title="Shear Force Envelope"

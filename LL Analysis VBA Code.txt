@@ -4,7 +4,7 @@ Option Explicit
 ' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 TRUCK)
 ' Fixes: Variable Spans, Error Handling, Stepped Shear, Support Reaction Diagrams
 ' Lane UDL: positive/negative influence zones, including partial elements.
-' NO lane-load DLA, placement-dependent truck DLA,
+' NO lane-load DLA, uniform span-based truck DLA (40/30/25% x d),
 ' adaptive sweep step, upward-positive reactions
 ' ==============================================================================
 
@@ -522,6 +522,16 @@ Sub MainAnalysis()
     Dim isDlaOverridden As Boolean
     DLA_Val = ReadDLASettings(wsIn, isDlaOverridden, DLA_Base, DLA_Multiplier)
 
+    ' Uniform span-based auto DLA x d: selected-axle placement-dependent DLA
+    ' flips 40%<->30% when an axle sits exactly at a support/root (zero
+    ' contribution), producing single-node kinks in the moment envelope
+    ' (verified by dense point sweeps). Span-based uniform keeps peaks and
+    ' smooths the diagram; statics stay continuous-optimised + influence UDL.
+    If Not isDlaOverridden Then
+        DLA_Base = SpanBasedAutoDLA(spanLengths, numSpans, spacings, nAxles)
+        DLA_Val = DLA_Base * DLA_Multiplier
+    End If
+
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
     ' --- 2. FEM MESH GENERATION ---
@@ -686,7 +696,7 @@ Sub MainAnalysis()
                             xTruckSteps, nTruckSteps, _
                             TrkMaxV, TrkMinV, TrkMaxM, TrkMinM, _
                             TrkMaxD, TrkMinD, TrkMaxR, TrkMinR, _
-                            Not isDlaOverridden, DLA_Multiplier, TRUCK_INFLUENCE_DEPENDENT
+                            False, DLA_Multiplier, TRUCK_INFLUENCE_DEPENDENT
 
         ComputeSupportSummary TrkMaxR, TrkMinR, xTruckSteps, _
                               nTruckSteps, nSupports, _
@@ -769,7 +779,7 @@ Sub MainAnalysis()
     If m_TruckGovReady Then
         WriteTruckDiagnostics xNodes, xShear, axles, spacings, nAxles, elemLens, nTotalElems, _
             nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports, _
-            Not isDlaOverridden, DLA_Base, DLA_Multiplier, 1# + DLA_Val
+            False, DLA_Base, DLA_Multiplier, 1# + DLA_Val
     End If
     If loadCase >= 2 Then
         WriteUDLTracer wsIn, xNodes, xShear, supportX, _
@@ -959,6 +969,39 @@ Private Function TruckGroupDLA(count As Long, frontThree As Boolean) As Double
             If frontThree Then TruckGroupDLA = 0.3 Else TruckGroupDLA = DLA_FACTOR
         Case Else: TruckGroupDLA = DLA_FACTOR
     End Select
+End Function
+
+Private Function MaxAxlesOnSpan(spanLen As Double, spacings() As Double, nAxles As Long) As Long
+    Dim first As Long, nxt As Long, dist As Double, count As Long, best As Long
+    best = 1
+    For first = 0 To nAxles - 1
+        dist = 0#: count = 1
+        For nxt = first To nAxles - 2
+            dist = dist + spacings(nxt)
+            If dist > spanLen + 0.000001 Then Exit For
+            count = count + 1
+        Next nxt
+        If count > best Then best = count
+    Next first
+    MaxAxlesOnSpan = best
+End Function
+
+Private Function SpanBasedAutoDLA(spanLengths() As Double, numSpans As Long, _
+                                  spacings() As Double, nAxles As Long) As Double
+    Dim i As Long, count As Long, cand As Double, best As Double
+    best = DLA_FACTOR
+    For i = LBound(spanLengths) To LBound(spanLengths) + numSpans - 1
+        count = MaxAxlesOnSpan(spanLengths(i), spacings, nAxles)
+        If count <= 1 Then
+            cand = 0.4
+        ElseIf count = 2 Then
+            cand = 0.3
+        Else
+            cand = DLA_FACTOR
+        End If
+        If cand > best Then best = cand
+    Next i
+    SpanBasedAutoDLA = best
 End Function
 
 Private Function TruckLoadElement(position As Double, side As Long, nodes() As Double, _
@@ -3097,12 +3140,10 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
     If LCase$(label) = "lane" Then
         dlaNote = "DLA = 0% (NO LANE DLA)"
     ElseIf Not isDlaOverridden Then
-        dlaNote = "TRUCK DLA = AUTO PER PLACEMENT; " & _
-                  IIf(TRUCK_INFLUENCE_DEPENDENT, "SELECTED AXLES; ", "ALL AXLES ON BRIDGE; ") & _
-                  Format(40# * DLA_Multiplier, "0.00") & "%/" & _
-                  Format(30# * DLA_Multiplier, "0.00") & "%/" & _
-                  Format(25# * DLA_Multiplier, "0.00") & "% EFFECTIVE" & _
-                  "; multiplier " & Format(DLA_Multiplier, "0.########")
+        dlaNote = "TRUCK DLA = AUTO SPAN-BASED UNIFORM " & _
+                  Format(DLA_Val * 100, "0.00") & "% EFFECTIVE" & _
+                  " (BASE " & Format(DLA_Base * 100, "0.00") & _
+                  "% x d " & Format(DLA_Multiplier, "0.########") & ")"
     Else
         dlaNote = "DLA = " & Format(DLA_Val * 100, "0.00") & "% EFFECTIVE" & _
                   " OVERRIDE"

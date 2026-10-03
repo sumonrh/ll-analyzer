@@ -8,6 +8,7 @@ export type AnalysisConfig = {
     truckIncrement: number;
     loadCase: LoadCase;
     dlaOverride?: number | null;
+    dlaMultiplier?: number;
 };
 export type EnvelopePoint = { x: number; max: number; min: number };
 export type ReactionEnvelope = EnvelopePoint & { govPos: number };
@@ -18,6 +19,9 @@ export type CaseResults = {
     reactions: ReactionEnvelope[];
     reactionDiagrams: EnvelopePoint[][];
     dlaUsed: number;
+    dlaAuto: boolean;
+    dlaBase: number;
+    dlaMultiplier: number;
 };
 export type AnalysisResults = CaseResults & {
     cases: Partial<Record<LoadCase, CaseResults>>;
@@ -53,13 +57,20 @@ export const DEFAULT_AXLES: Axle[] = [
 ];
 export const DEFAULT_CONFIG: AnalysisConfig = {
     E: 200000000000, I: 0.005, nElemsPerSpan: 40, truckIncrement: 0.25,
-    loadCase: 'truck', dlaOverride: null,
+    loadCase: 'truck', dlaOverride: null, dlaMultiplier: 1,
 };
 export const MAX_PATTERN_SPANS = 12;
 export const MAX_AXLES = 20;
 export const MAX_SWEEP_STEPS = 6000;
 const MIN_SWEEP_STEP = 0.02;
 const BAND = 3;
+// VBA parity constants (verified against Midas Civil)
+const DLA_FACTOR = 0.25;
+const LANE_TRUCK_FACTOR = 0.8;
+const LANE_UDL = 9;
+const MAX_TOTAL_ELEMENTS = 1000;
+const INFLUENCE_ROOT_TOL = 1e-10;
+const INFLUENCE_VALUE_TOL = 1e-12;
 
 function maxAxlesOnLength(length: number, axles: Axle[]): number {
     let best = 1;
@@ -92,6 +103,23 @@ export function computeAutoDlaInfo(spans: Span[], axles: Axle[]) {
     const desc = axleCount <= 1 ? '1 axle on span'
         : axleCount === 2 ? '2 axles on span (tandem)' : '>= 3 axles on span';
     return { dla, axleCount, maxSpan: Math.max(0, ...spans.map(s => s.length)), governingSpan, desc };
+}
+
+export function resolveDla(config: AnalysisConfig): { isAuto: boolean; base: number; multiplier: number; effective: number } {
+    let multiplier = config.dlaMultiplier ?? 1;
+    if (!Number.isFinite(multiplier)) multiplier = 1;
+    multiplier = Math.max(0, Math.min(1, multiplier));
+    const isAuto = config.dlaOverride == null;
+    const base = isAuto ? 0 : (config.dlaOverride as number);
+    return { isAuto, base, multiplier, effective: base * multiplier };
+}
+
+export function truckGroupDla(count: number, frontThree: boolean): number {
+    if (count <= 0) return 0;
+    if (count === 1) return 0.40;
+    if (count === 2) return 0.30;
+    if (count === 3) return frontThree ? 0.30 : DLA_FACTOR;
+    return DLA_FACTOR;
 }
 
 export function computeEffectiveIncrement(
@@ -164,13 +192,16 @@ export function validateInputs({ spans, axles, config }: AnalysisRequest): void 
     });
     if (config.dlaOverride != null && (!Number.isFinite(config.dlaOverride) || config.dlaOverride < 0))
         throw new Error('DLA must be >= 0.');
+    const mult = config.dlaMultiplier ?? 1;
+    if (!Number.isFinite(mult) || mult < 0 || mult > 1)
+        throw new Error('Truck DLA multiplier (d) must be between 0 and 1.');
     const totalLength = spans.reduce((sum, s) => sum + s.length, 0);
     const truckLength = axles.slice(0, -1).reduce((sum, a) => sum + a.spacing, 0);
     if (!Number.isFinite(totalLength + 2 * truckLength) || !Number.isFinite(config.E * config.I))
         throw new Error('Geometry or stiffness exceeds the supported numeric range.');
     if (!Number.isSafeInteger(spans.length * config.nElemsPerSpan) ||
-        spans.length * config.nElemsPerSpan > 10000)
-        throw new Error('The model is limited to 10,000 beam elements. Reduce the mesh resolution.');
+        spans.length * config.nElemsPerSpan > MAX_TOTAL_ELEMENTS)
+        throw new Error(`The model is limited to ${MAX_TOTAL_ELEMENTS} beam elements. Reduce the mesh resolution.`);
 }
 
 function reverseAxles(axles: Axle[]): Axle[] {
@@ -216,7 +247,7 @@ class BeamSystem {
     readonly deflectionOffset: number;
     readonly reactionOffset: number;
     readonly response: Float64Array;
-    private readonly lengths: Float64Array;
+    readonly lengths: Float64Array;
     private readonly localK: Float64Array;
     private readonly stiffness: Float64Array;
     private readonly freeMap: number[] = [];
@@ -351,20 +382,12 @@ class BeamSystem {
         return this.solve();
     }
 
-    udl(spanIndex: number, intensity: number): Float64Array {
+    /** Solve a unit (1 kN) point load and return a copy of the packed response. */
+    unitResponse(position: number): Float64Array {
         this.clearLoads();
-        const first = spanIndex * this.config.nElemsPerSpan;
-        for (let e = first; e < first + this.config.nElemsPerSpan; e++) {
-            const le = this.lengths[e];
-            const force = -intensity * le / 2 * 1000;
-            const moment = -intensity * le * le / 12 * 1000;
-            const values = [force, moment, force, -moment];
-            for (let i = 0; i < 4; i++) {
-                this.load[e * 2 + i] += values[i];
-                this.elemLoads[e * 4 + i] = values[i];
-            }
-        }
-        return this.solve();
+        this.pointLoad(position, 1);
+        this.solve();
+        return this.response.slice();
     }
 
     private solve(): Float64Array {
@@ -409,109 +432,1034 @@ class BeamSystem {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VBA-parity influence engine (verified against Midas Civil)
+// FEA + influence-line UDL placement, continuous truck optimisation,
+// placement-dependent selected-axle DLA with d multiplier.
+// ---------------------------------------------------------------------------
+
+function fitInfluenceCubic(y0: number, y1: number, y2: number, y3: number): number[] {
+    const d1 = y1 - y0;
+    const d2 = y2 - 2 * y1 + y0;
+    const d3 = y3 - 3 * y2 + 3 * y1 - y0;
+    return [
+        y0 - 0.5 * d1 + 0.375 * d2 - 0.3125 * d3,
+        4 * d1 - 4 * d2 + 23 * d3 / 6,
+        8 * d2 - 12 * d3,
+        32 * d3 / 3,
+    ];
+}
+
+function influenceValue(coeff: ArrayLike<number>, xi: number): number {
+    return ((coeff[3] * xi + coeff[2]) * xi + coeff[1]) * xi + coeff[0];
+}
+
+function influenceIntegral(coeff: ArrayLike<number>, a: number, b: number): number {
+    return (b - a) * (coeff[0] + coeff[1] * (a + b) / 2 +
+        coeff[2] * (a * a + a * b + b * b) / 3 +
+        coeff[3] * (a ** 3 + a * a * b + a * b * b + b ** 3) / 4);
+}
+
+function insertInfluenceCut(cuts: number[], xi: number): void {
+    if (xi < -INFLUENCE_ROOT_TOL || xi > 1 + INFLUENCE_ROOT_TOL) return;
+    const clamped = xi < 0 ? 0 : xi > 1 ? 1 : xi;
+    for (const existing of cuts) {
+        if (Math.abs(existing - clamped) <= INFLUENCE_ROOT_TOL) return;
+    }
+    cuts.push(clamped);
+}
+
+function truckStationaryCuts(coeff: ArrayLike<number>): number[] {
+    const cuts: number[] = [0, 1];
+    let scale = 0;
+    for (let i = 0; i < 4; i++) scale = Math.max(scale, Math.abs(coeff[i]));
+    if (scale === 0) return cuts;
+    const qa = 3 * coeff[3] / scale;
+    const qb = 2 * coeff[2] / scale;
+    const qc = coeff[1] / scale;
+    if (Math.abs(qa) <= INFLUENCE_VALUE_TOL) {
+        if (Math.abs(qb) > INFLUENCE_VALUE_TOL) insertInfluenceCut(cuts, -qc / qb);
+    } else {
+        let disc = qb * qb - 4 * qa * qc;
+        if (Math.abs(disc) <= INFLUENCE_VALUE_TOL * (qb * qb + Math.abs(4 * qa * qc))) disc = 0;
+        if (disc >= 0) {
+            const q = qb >= 0 ? -0.5 * (qb + Math.sqrt(disc)) : -0.5 * (qb - Math.sqrt(disc));
+            if (q === 0) {
+                insertInfluenceCut(cuts, -qb / (2 * qa));
+            } else {
+                insertInfluenceCut(cuts, q / qa);
+                insertInfluenceCut(cuts, qc / q);
+            }
+        }
+    }
+    return cuts;
+}
+
+function influenceCuts(coeff: ArrayLike<number>): number[] {
+    let scale = 0;
+    for (let k = 0; k < 4; k++) scale = Math.max(scale, Math.abs(coeff[k]));
+    const cuts: number[] = [0, 1];
+    if (scale === 0) return cuts;
+    const stationary = truckStationaryCuts(coeff);
+    stationary.sort((a, b) => a - b);
+    for (const s of stationary) {
+        if (Math.abs(influenceValue(coeff, s) / scale) <= INFLUENCE_VALUE_TOL) insertInfluenceCut(cuts, s);
+    }
+    for (let i = 0; i < stationary.length - 1; i++) {
+        let a = stationary[i];
+        let b = stationary[i + 1];
+        let fa = influenceValue(coeff, a) / scale;
+        const fb = influenceValue(coeff, b) / scale;
+        if (Math.abs(fa) > INFLUENCE_VALUE_TOL && Math.abs(fb) > INFLUENCE_VALUE_TOL && fa * fb < 0) {
+            for (let iter = 0; iter < 64; iter++) {
+                const m = (a + b) / 2;
+                const fm = influenceValue(coeff, m) / scale;
+                if (fm === 0) { a = m; b = m; break; }
+                else if (fa * fm < 0) b = m;
+                else { a = m; fa = fm; }
+                if (b - a <= INFLUENCE_ROOT_TOL) break;
+            }
+            insertInfluenceCut(cuts, (a + b) / 2);
+        }
+    }
+    cuts.sort((a, b) => a - b);
+    return cuts;
+}
+
+function truckLoadElement(position: number, side: number, nodes: ArrayLike<number>): number {
+    const n = nodes.length - 1;
+    const tol = INFLUENCE_ROOT_TOL * (1 + nodes[n]);
+    if (position < -tol || position > nodes[n] + tol) return -1;
+    if (Math.abs(position) <= tol && side < 0) return -1;
+    if (Math.abs(position - nodes[n]) <= tol && side > 0) return -1;
+    let lo = 0;
+    let hi = n;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (nodes[mid] < position - tol) lo = mid + 1;
+        else hi = mid;
+    }
+    let elem: number;
+    if (Math.abs(nodes[lo] - position) <= tol && side > 0) elem = lo;
+    else elem = lo - 1;
+    if (elem < 0) elem = 0;
+    if (elem >= n) elem = n - 1;
+    return elem;
+}
+
+type TruckGeometry = {
+    positions: number[];
+    midElement: Int32Array;
+    pointElement: Int32Array;
+    z: Float64Array;
+    delta: Float64Array;
+    pointXi: Float64Array;
+    intervals: number;
+};
+
+function uniqueSortedPositions(values: number[], tol: number): number[] {
+    const sorted = [...values].sort((a, b) => a - b);
+    const unique: number[] = [];
+    for (const v of sorted) {
+        if (unique.length === 0 || v - unique[unique.length - 1] > tol) unique.push(v);
+    }
+    return unique;
+}
+
+function buildTruckGeometry(nodes: number[], offsets: number[], nAxles: number): TruckGeometry {
+    const raw: number[] = [];
+    for (let p = 0; p < nodes.length; p++) {
+        for (let i = 0; i < nAxles; i++) raw.push(nodes[p] + offsets[i]);
+    }
+    const tol = INFLUENCE_ROOT_TOL * (1 + nodes[nodes.length - 1]);
+    const positions = uniqueSortedPositions(raw, tol);
+    const intervals = Math.max(0, positions.length - 1);
+    const midElement = new Int32Array(Math.max(0, nAxles * intervals));
+    const pointElement = new Int32Array(Math.max(0, nAxles * intervals));
+    const z = new Float64Array(Math.max(0, nAxles * intervals));
+    const delta = new Float64Array(Math.max(0, nAxles * intervals));
+    const pointXi = new Float64Array(Math.max(0, nAxles * intervals));
+    if (positions.length < 2) return { positions, midElement, pointElement, z, delta, pointXi, intervals };
+    for (let p = 0; p < positions.length - 1; p++) {
+        const a = positions[p];
+        const b = positions[p + 1];
+        for (let i = 0; i < nAxles; i++) {
+            const idx = i * intervals + p;
+            const e = truckLoadElement((a + b) / 2 - offsets[i], 0, nodes);
+            midElement[idx] = e;
+            if (e >= 0) {
+                z[idx] = (a - offsets[i] - nodes[e]) / (nodes[e + 1] - nodes[e]);
+                delta[idx] = (b - a) / (nodes[e + 1] - nodes[e]);
+            }
+            const pe = truckLoadElement(a - offsets[i], 0, nodes);
+            pointElement[idx] = pe;
+            if (pe >= 0) {
+                let xi = (a - offsets[i] - nodes[pe]) / (nodes[pe + 1] - nodes[pe]);
+                if (xi < 0) xi = 0;
+                if (xi > 1) xi = 1;
+                pointXi[idx] = xi;
+            }
+        }
+    }
+    return { positions, midElement, pointElement, z, delta, pointXi, intervals };
+}
+
+function buildInfluenceCache(system: BeamSystem): { coeffs: Float64Array; nResponses: number } {
+    const nElems = system.nElems;
+    const nResponses = system.response.length;
+    const coeffs = new Float64Array(nElems * nResponses * 4);
+    const xs = [0.125, 0.375, 0.625, 0.875];
+    for (let e = 0; e < nElems; e++) {
+        const le = system.lengths[e];
+        const x0 = system.xNodes[e];
+        const samples: Float64Array[] = [];
+        for (let p = 0; p < 4; p++) {
+            samples.push(system.unitResponse(x0 + xs[p] * le));
+        }
+        for (let r = 0; r < nResponses; r++) {
+            const fitted = fitInfluenceCubic(samples[0][r], samples[1][r], samples[2][r], samples[3][r]);
+            const base = (e * nResponses + r) * 4;
+            coeffs[base] = fitted[0];
+            coeffs[base + 1] = fitted[1];
+            coeffs[base + 2] = fitted[2];
+            coeffs[base + 3] = fitted[3];
+        }
+    }
+    return { coeffs, nResponses };
+}
+
+function calculateUDLEnvelopes(
+    coeffs: Float64Array, nElems: number, nResponses: number,
+    elemLens: ArrayLike<number>, w: number
+): { max: Float64Array; min: Float64Array } {
+    const max = new Float64Array(nResponses);
+    const min = new Float64Array(nResponses);
+    if (w <= 0) return { max, min };
+    const coeff = [0, 0, 0, 0];
+    for (let e = 0; e < nElems; e++) {
+        for (let r = 0; r < nResponses; r++) {
+            const base = (e * nResponses + r) * 4;
+            coeff[0] = coeffs[base];
+            coeff[1] = coeffs[base + 1];
+            coeff[2] = coeffs[base + 2];
+            coeff[3] = coeffs[base + 3];
+            const cuts = influenceCuts(coeff);
+            for (let i = 0; i < cuts.length - 1; i++) {
+                const area = w * elemLens[e] * influenceIntegral(coeff, cuts[i], cuts[i + 1]);
+                if (area > 0) max[r] += area;
+                else min[r] += area;
+            }
+        }
+    }
+    return { max, min };
+}
+
+type PolyResult = { poly: Float64Array; masks: Int32Array; bases: Float64Array };
+
+function truckPolynomialPair(
+    response: number, a: number, b: number, side: number,
+    weights: ArrayLike<number>, offsets: ArrayLike<number>, nAxles: number,
+    nodes: ArrayLike<number>, coeffs: Float64Array, nResponses: number, nElems: number,
+    autoDLA: boolean, multiplier: number, axleFactor: number, isReverse: boolean,
+    cursor: Int32Array, responseCoeffs: Float64Array | null, useCursor: boolean,
+    useCoefficients: boolean, includePoint: boolean, geometry: TruckGeometry | null,
+    geometryIndex: number
+): PolyResult {
+    const poly = new Float64Array(16);
+    const masks = new Int32Array(4);
+    const bases = new Float64Array(4);
+    const counts = [0, 0, 0, 0];
+    let p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+    let q0 = 0, q1 = 0, q2 = 0, q3 = 0;
+    let pointMax = 0, pointMin = 0;
+    const n = nodes.length - 1;
+    const totalLength = nodes[n];
+    const tol = INFLUENCE_ROOT_TOL * (1 + totalLength);
+    const lastRow = includePoint ? 3 : 1;
+    let bit = isReverse ? Math.pow(2, nAxles - 1) : 1;
+    const intervals = geometry?.intervals ?? 0;
+    for (let i = 0; i < nAxles; i++) {
+        const position = a - offsets[i];
+        let e = -1;
+        if (geometry && geometryIndex >= 0) {
+            e = geometry.midElement[i * intervals + geometryIndex];
+            if (useCursor) cursor[i] = e;
+        } else if (includePoint) {
+            const midpoint = (a + b) / 2 - offsets[i];
+            e = -1;
+            if (midpoint >= -tol && midpoint <= totalLength + tol) {
+                e = cursor[i];
+                if (e < 0) e = 0;
+                const left = midpoint - tol;
+                while (e < nElems - 1 && nodes[e + 1] < left) e++;
+                while (e > 0 && nodes[e] >= left) e--;
+                // Clamp into range
+                if (e < 0) e = 0;
+                if (e >= nElems) e = nElems - 1;
+            }
+            cursor[i] = e;
+        } else if (useCursor) {
+            e = truckLoadElementWithHint((a + b) / 2 - offsets[i], side, nodes, cursor[i]);
+            cursor[i] = e;
+        } else {
+            e = truckLoadElement((a + b) / 2 - offsets[i], side, nodes);
+        }
+        if (e >= 0 && weights[i] !== 0) {
+            let curZ: number;
+            let curDelta: number;
+            if (geometry && geometryIndex >= 0) {
+                curZ = geometry.z[i * intervals + geometryIndex];
+                curDelta = geometry.delta[i * intervals + geometryIndex];
+            } else {
+                curZ = (a - offsets[i] - nodes[e]) / (nodes[e + 1] - nodes[e]);
+                curDelta = (b - a) / (nodes[e + 1] - nodes[e]);
+            }
+            let zz = curZ;
+            if (a === b) {
+                if (zz < 0) zz = 0;
+                if (zz > 1) zz = 1;
+            }
+            let c0: number, c1: number, c2: number, c3: number, scale: number;
+            if (useCoefficients && responseCoeffs) {
+                c0 = responseCoeffs[e * 7];
+                c1 = responseCoeffs[e * 7 + 1];
+                c2 = responseCoeffs[e * 7 + 2];
+                c3 = responseCoeffs[e * 7 + 3];
+                scale = responseCoeffs[e * 7 + 4];
+            } else {
+                const base = (e * nResponses + response) * 4;
+                c0 = coeffs[base];
+                c1 = coeffs[base + 1];
+                c2 = coeffs[base + 2];
+                c3 = coeffs[base + 3];
+                scale = Math.abs(c0);
+                if (Math.abs(c1) > scale) scale = Math.abs(c1);
+                if (Math.abs(c2) > scale) scale = Math.abs(c2);
+                if (Math.abs(c3) > scale) scale = Math.abs(c3);
+            }
+            const xiMid = zz + curDelta / 2;
+            const unitMid = ((c3 * xiMid + c2) * xiMid + c1) * xiMid + c0;
+            const valueMid = weights[i] * unitMid;
+            const threshold = INFLUENCE_VALUE_TOL * scale * Math.abs(weights[i]);
+            let row = -1;
+            if (valueMid > threshold) row = 0;
+            if (valueMid < -threshold) row = 1;
+            if (row >= 0) {
+                if (a === b) {
+                    if (row === 0) p0 += valueMid;
+                    else q0 += valueMid;
+                } else {
+                    const unit0 = ((c3 * zz + c2) * zz + c1) * zz + c0;
+                    if (row === 0) {
+                        p0 += weights[i] * unit0;
+                        p1 += weights[i] * curDelta * (c1 + 2 * c2 * zz + 3 * c3 * zz * zz);
+                        p2 += weights[i] * curDelta * curDelta * (c2 + 3 * c3 * zz);
+                        p3 += weights[i] * Math.pow(curDelta, 3) * c3;
+                    } else {
+                        q0 += weights[i] * unit0;
+                        q1 += weights[i] * curDelta * (c1 + 2 * c2 * zz + 3 * c3 * zz * zz);
+                        q2 += weights[i] * curDelta * curDelta * (c2 + 3 * c3 * zz);
+                        q3 += weights[i] * Math.pow(curDelta, 3) * c3;
+                    }
+                }
+                masks[row] |= bit;
+                counts[row]++;
+            }
+        }
+        if (includePoint && weights[i] !== 0) {
+            let pe = -1;
+            if (geometry && geometryIndex >= 0) {
+                pe = geometry.pointElement[i * intervals + geometryIndex];
+            } else {
+                pe = -1;
+                if (position >= -tol && position <= totalLength + tol) {
+                    pe = e;
+                    if (pe < 0) pe = nElems - 1;
+                    const left = position - tol;
+                    while (pe > 0 && nodes[pe] >= left) pe--;
+                }
+            }
+            if (pe >= 0) {
+                let pc0: number, pc1: number, pc2: number, pc3: number, pscale: number;
+                if (pe !== e || (geometry && geometryIndex >= 0)) {
+                    if (useCoefficients && responseCoeffs) {
+                        pc0 = responseCoeffs[pe * 7];
+                        pc1 = responseCoeffs[pe * 7 + 1];
+                        pc2 = responseCoeffs[pe * 7 + 2];
+                        pc3 = responseCoeffs[pe * 7 + 3];
+                        pscale = responseCoeffs[pe * 7 + 4];
+                    } else {
+                        const base = (pe * nResponses + response) * 4;
+                        pc0 = coeffs[base];
+                        pc1 = coeffs[base + 1];
+                        pc2 = coeffs[base + 2];
+                        pc3 = coeffs[base + 3];
+                        pscale = Math.abs(pc0);
+                        if (Math.abs(pc1) > pscale) pscale = Math.abs(pc1);
+                        if (Math.abs(pc2) > pscale) pscale = Math.abs(pc2);
+                        if (Math.abs(pc3) > pscale) pscale = Math.abs(pc3);
+                    }
+                } else {
+                    // Reuse current element coefficients
+                    if (useCoefficients && responseCoeffs) {
+                        pc0 = responseCoeffs[e * 7];
+                        pc1 = responseCoeffs[e * 7 + 1];
+                        pc2 = responseCoeffs[e * 7 + 2];
+                        pc3 = responseCoeffs[e * 7 + 3];
+                        pscale = responseCoeffs[e * 7 + 4];
+                    } else {
+                        const base = (e * nResponses + response) * 4;
+                        pc0 = coeffs[base];
+                        pc1 = coeffs[base + 1];
+                        pc2 = coeffs[base + 2];
+                        pc3 = coeffs[base + 3];
+                        pscale = Math.abs(pc0);
+                        if (Math.abs(pc1) > pscale) pscale = Math.abs(pc1);
+                        if (Math.abs(pc2) > pscale) pscale = Math.abs(pc2);
+                        if (Math.abs(pc3) > pscale) pscale = Math.abs(pc3);
+                    }
+                }
+                let pxi: number;
+                if (geometry && geometryIndex >= 0) pxi = geometry.pointXi[i * intervals + geometryIndex];
+                else {
+                    pxi = (a - offsets[i] - nodes[pe]) / (nodes[pe + 1] - nodes[pe]);
+                    if (pxi < 0) pxi = 0;
+                    if (pxi > 1) pxi = 1;
+                }
+                const unitP = ((pc3 * pxi + pc2) * pxi + pc1) * pxi + pc0;
+                const valueP = weights[i] * unitP;
+                const thresholdP = INFLUENCE_VALUE_TOL * pscale * Math.abs(weights[i]);
+                let prow = -1;
+                if (valueP > thresholdP) prow = 2;
+                if (valueP < -thresholdP) prow = 3;
+                if (prow >= 0) {
+                    if (prow === 2) pointMax += valueP;
+                    else pointMin += valueP;
+                    masks[prow] |= bit;
+                    counts[prow]++;
+                }
+            }
+        }
+        if (isReverse) bit = Math.floor(bit / 2);
+        else bit = bit * 2;
+    }
+    for (let row = 0; row <= lastRow; row++) {
+        bases[row] = 0;
+        if (autoDLA) bases[row] = truckGroupDla(counts[row], masks[row] === 7);
+        const factor = axleFactor * (1 + bases[row] * multiplier);
+        let v: number;
+        if (row === 0) v = p0;
+        else if (row === 1) v = q0;
+        else if (row === 2) v = pointMax;
+        else v = pointMin;
+        if (a === b || row >= 2) {
+            poly[row * 4] = v * axleFactor * (1 + bases[row] * multiplier);
+            poly[row * 4 + 1] = 0;
+            poly[row * 4 + 2] = 0;
+            poly[row * 4 + 3] = 0;
+        } else {
+            poly[row * 4] = v * factor;
+            if (row === 0) {
+                poly[row * 4 + 1] = p1 * factor;
+                poly[row * 4 + 2] = p2 * factor;
+                poly[row * 4 + 3] = p3 * factor;
+            } else {
+                poly[row * 4 + 1] = q1 * factor;
+                poly[row * 4 + 2] = q2 * factor;
+                poly[row * 4 + 3] = q3 * factor;
+            }
+        }
+    }
+    return { poly, masks, bases };
+}
+
+function truckLoadElementWithHint(position: number, side: number, nodes: ArrayLike<number>, hint: number): number {
+    const n = nodes.length - 1;
+    const tol = INFLUENCE_ROOT_TOL * (1 + nodes[n]);
+    if (position < -tol || position > nodes[n] + tol) return -1;
+    if (Math.abs(position) <= tol && side < 0) return -1;
+    if (Math.abs(position - nodes[n]) <= tol && side > 0) return -1;
+    let lo = 0;
+    let hi = n;
+    if (hint >= 0 && hint < n && nodes[hint] < position - tol) {
+        lo = hint;
+        while (lo < n && nodes[lo] < position - tol) lo++;
+        hi = lo;
+    } else {
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (nodes[mid] < position - tol) lo = mid + 1;
+            else hi = mid;
+        }
+    }
+    let elem: number;
+    if (Math.abs(nodes[lo] - position) <= tol && side > 0) elem = lo;
+    else elem = lo - 1;
+    if (elem < 0) elem = 0;
+    if (elem >= n) elem = n - 1;
+    return elem;
+}
+
+function prepareTruckResponse(
+    response: number, nodes: number[], coeffs: Float64Array,
+    nElems: number, nResponses: number
+): { knots: number[]; responseCoeffs: Float64Array; isZero: boolean } {
+    const knots: number[] = [];
+    const responseCoeffs = new Float64Array(nElems * 7);
+    let isZero = true;
+    const totalLength = nodes[nodes.length - 1];
+    const coeff = [0, 0, 0, 0];
+    for (let e = 0; e < nElems; e++) {
+        const base = (e * nResponses + response) * 4;
+        let scale = 0;
+        for (let p = 0; p < 4; p++) {
+            coeff[p] = coeffs[base + p];
+            responseCoeffs[e * 7 + p] = coeff[p];
+            scale = Math.max(scale, Math.abs(coeff[p]));
+        }
+        responseCoeffs[e * 7 + 4] = scale;
+        if (scale !== 0) isZero = false;
+        let upper = coeff[0];
+        let lower = coeff[0];
+        for (let p = 1; p < 4; p++) {
+            if (coeff[p] > 0) upper += coeff[p];
+            else lower += coeff[p];
+        }
+        const extension = 4 * INFLUENCE_ROOT_TOL * (1 + totalLength) / (nodes[e + 1] - nodes[e]);
+        const allowance = extension * (Math.abs(coeff[1]) + (2 + extension) * Math.abs(coeff[2]) +
+            (3 + 3 * extension + extension * extension) * Math.abs(coeff[3])) +
+            INFLUENCE_VALUE_TOL * (1 + 4 * scale);
+        responseCoeffs[e * 7 + 5] = upper + allowance;
+        responseCoeffs[e * 7 + 6] = lower - allowance;
+        const cuts = influenceCuts(coeff);
+        for (const c of cuts) {
+            const pos = nodes[e] + c * (nodes[e + 1] - nodes[e]);
+            if (knots.length === 0 || pos !== knots[knots.length - 1]) knots.push(pos);
+        }
+    }
+    return { knots, responseCoeffs, isZero };
+}
+
+function truckGeometryCanImprove(
+    index: number, geometry: TruckGeometry, responseCoeffs: Float64Array,
+    weights: ArrayLike<number>, nAxles: number, factor: number, bestMax: number, bestMin: number
+): boolean {
+    let maxValue = 0;
+    let minValue = 0;
+    const intervals = geometry.intervals;
+    for (let i = 0; i < nAxles; i++) {
+        const e = geometry.midElement[i * intervals + index];
+        const point = geometry.pointElement[i * intervals + index];
+        let upper = 0;
+        let lower = 0;
+        if (e >= 0) {
+            const up = responseCoeffs[e * 7 + 5];
+            const lo = responseCoeffs[e * 7 + 6];
+            if (up > upper) upper = up;
+            if (lo < lower) lower = lo;
+        }
+        if (point >= 0 && point !== e) {
+            const up = responseCoeffs[point * 7 + 5];
+            const lo = responseCoeffs[point * 7 + 6];
+            if (up > upper) upper = up;
+            if (lo < lower) lower = lo;
+        }
+        const w = weights[i];
+        if (w >= 0) {
+            maxValue += w * upper;
+            minValue += w * lower;
+        } else {
+            maxValue += w * lower;
+            minValue += w * upper;
+        }
+    }
+    maxValue *= factor;
+    minValue *= factor;
+    const margin = INFLUENCE_VALUE_TOL * (1 + Math.abs(maxValue) + Math.abs(minValue));
+    return maxValue + margin > bestMax || minValue - margin < bestMin;
+}
+
+function truckResponseExtrema(
+    response: number, weights: number[], offsets: number[], nAxles: number,
+    nodes: number[], knots: number[], responseCoeffs: Float64Array,
+    geometry: TruckGeometry, autoDLA: boolean, multiplier: number,
+    axleFactor: number, isReverse: boolean,
+    best: number[], govLead: number[], govMask: Int32Array,
+    govBase: number[], govSide: Int32Array,
+    coeffs: Float64Array, nResponses: number, nElems: number
+): void {
+    const raw: number[] = [];
+    for (const k of knots) {
+        for (let i = 0; i < nAxles; i++) raw.push(k + offsets[i]);
+    }
+    const tol = INFLUENCE_ROOT_TOL * (1 + nodes[nodes.length - 1]);
+    const positions = uniqueSortedPositions(raw, tol);
+    const unique = positions.length;
+    if (unique === 0) return;
+    const geometryLast = geometry.positions.length - 1;
+    let boundFactor = axleFactor;
+    if (autoDLA) boundFactor = boundFactor * (1 + 0.4 * multiplier);
+    const cursor = new Int32Array(nAxles);
+    let geometryPosition = 0;
+    for (let i = 0; i < unique; i++) {
+        const a = positions[i];
+        let b = a;
+        let pointOffset = 0;
+        if (i < unique - 1) {
+            b = positions[i + 1];
+            pointOffset = 2;
+        }
+        while (geometryPosition < geometryLast && geometry.positions[geometryPosition] < a) geometryPosition++;
+        let geometryIndex = -1;
+        if (pointOffset === 2 && geometryPosition < geometryLast) {
+            if (a === geometry.positions[geometryPosition] && b === geometry.positions[geometryPosition + 1]) {
+                geometryIndex = geometryPosition;
+            }
+        }
+        if (geometryIndex >= 0 && boundFactor >= 0) {
+            if (!truckGeometryCanImprove(geometryIndex, geometry, responseCoeffs, weights, nAxles, boundFactor, best[0], best[1])) {
+                continue;
+            }
+        }
+        const { poly, masks, bases } = truckPolynomialPair(
+            response, a, b, 0, weights, offsets, nAxles, nodes, coeffs, nResponses, nElems,
+            autoDLA, multiplier, axleFactor, isReverse, cursor, responseCoeffs, true, true,
+            pointOffset === 2, geometry, geometryIndex
+        );
+        for (let row = 0; row <= 1; row++) {
+            const value = poly[(row + pointOffset) * 4];
+            if ((row === 0 && value > best[row]) || (row === 1 && value < best[row])) {
+                best[row] = value;
+                govLead[row] = a;
+                govMask[row] = masks[row + pointOffset];
+                govBase[row] = bases[row + pointOffset];
+                govSide[row] = 0;
+            }
+        }
+        if (i < unique - 1) {
+            for (let row = 0; row <= 1; row++) {
+                if (masks[row] === 0) continue;
+                const c0 = poly[row * 4];
+                const c1 = poly[row * 4 + 1];
+                const c2 = poly[row * 4 + 2];
+                const c3 = poly[row * 4 + 3];
+                let bound = c0;
+                let boundScale = Math.abs(c0);
+                const powers = [c1, c2, c3];
+                for (const cp of powers) {
+                    boundScale += Math.abs(cp);
+                    if ((row === 0 && cp > 0) || (row === 1 && cp < 0)) bound += cp;
+                }
+                const margin = INFLUENCE_VALUE_TOL * (1 + boundScale);
+                if ((row === 0 && bound + margin <= best[row]) ||
+                    (row === 1 && bound - margin >= best[row])) continue;
+                const d0 = c1;
+                const d1 = c1 + c2;
+                const d2 = c1 + 2 * c2 + 3 * c3;
+                let candidates = [0, 1];
+                if (!((d0 >= 0 && d1 >= 0 && d2 >= 0) || (d0 <= 0 && d1 <= 0 && d2 <= 0))) {
+                    const stationary = truckStationaryCuts([c0, c1, c2, c3]);
+                    // truckStationaryCuts returns [0,1,...]; use interior points
+                    candidates = stationary;
+                }
+                for (const xi of candidates) {
+                    const lead = a + xi * (b - a);
+                    const value = ((c3 * xi + c2) * xi + c1) * xi + c0;
+                    if ((row === 0 && value > best[row]) || (row === 1 && value < best[row])) {
+                        let side = 0;
+                        if (xi === 0) side = 1;
+                        if (xi === 1) side = -1;
+                        best[row] = value;
+                        govLead[row] = lead;
+                        govMask[row] = masks[row];
+                        govBase[row] = bases[row];
+                        govSide[row] = side;
+                    }
+                }
+            }
+        }
+    }
+}
+
+function runInfluenceTruckEnvelope(
+    axleFactor: number, autoDLA: boolean, multiplier: number,
+    baseAxles: number[], spacings: number[], nAxles: number,
+    nodes: number[], nElems: number, nResponses: number,
+    coeffs: Float64Array, steps: number[], nSupports: number,
+    udlMax: Float64Array, udlMin: Float64Array,
+    onProgress?: (fraction: number, message: string) => void,
+    caseLabel = 'Truck'
+): {
+    maxima: Float64Array; minima: Float64Array;
+    histMax: Float64Array; histMin: Float64Array;
+    optMax: Float64Array; optMin: Float64Array; optGov: Float64Array;
+    truckSolves: number;
+} {
+    const maxima = new Float64Array(nResponses).fill(0);
+    const minima = new Float64Array(nResponses).fill(0);
+    const rOffset = 4 * nElems + 2;
+    // Forward / reverse weights and offsets
+    const forwardWeights = [...baseAxles];
+    const forwardOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) forwardOffsets[i] = forwardOffsets[i - 1] + spacings[i - 1];
+    const reverseWeights = [...baseAxles].reverse();
+    const reverseOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) reverseOffsets[i] = reverseOffsets[i - 1] + spacings[nAxles - 1 - i];
+    const forwardGeometry = buildTruckGeometry(nodes, forwardOffsets, nAxles);
+    const reverseGeometry = buildTruckGeometry(nodes, reverseOffsets, nAxles);
+    const optGov = new Float64Array(nSupports).fill(0);
+    let truckSolves = 0;
+    const best = [0, 0];
+    const govLead = [0, 0];
+    const govMask = new Int32Array(2);
+    const govBase = [0, 0];
+    const govSide = new Int32Array(2);
+    for (let r = 0; r < nResponses; r++) {
+        if (r % 20 === 0) onProgress?.(r / nResponses * 0.85, `${caseLabel}: optimising truck response ${r + 1} of ${nResponses}`);
+        const { knots, responseCoeffs, isZero } = prepareTruckResponse(r, nodes, coeffs, nElems, nResponses);
+        if (isZero) continue;
+        best[0] = maxima[r];
+        best[1] = minima[r];
+        const oldMax = best[0];
+        // Forward
+        truckResponseExtrema(r, forwardWeights, forwardOffsets, nAxles, nodes, knots, responseCoeffs,
+            forwardGeometry, autoDLA, multiplier, axleFactor, false, best, govLead, govMask, govBase, govSide,
+            coeffs, nResponses, nElems);
+        // Reverse
+        truckResponseExtrema(r, reverseWeights, reverseOffsets, nAxles, nodes, knots, responseCoeffs,
+            reverseGeometry, autoDLA, multiplier, axleFactor, true, best, govLead, govMask, govBase, govSide,
+            coeffs, nResponses, nElems);
+        maxima[r] = best[0];
+        minima[r] = best[1];
+        if (r >= rOffset && best[0] > oldMax) optGov[r - rOffset] = govLead[0];
+        truckSolves += 2;
+    }
+    // Sampled reaction histories at sweep steps (for diagrams), with selected-group DLA
+    const nSteps = steps.length;
+    const histMax = new Float64Array(nSteps * nSupports).fill(-Infinity);
+    const histMin = new Float64Array(nSteps * nSupports).fill(Infinity);
+    const emptyGeometry: TruckGeometry = {
+        positions: [], midElement: new Int32Array(0), pointElement: new Int32Array(0),
+        z: new Float64Array(0), delta: new Float64Array(0), pointXi: new Float64Array(0), intervals: 0,
+    };
+    for (let direction = 0; direction < 2; direction++) {
+        const weights = direction === 0 ? forwardWeights : reverseWeights;
+        const offsets = direction === 0 ? forwardOffsets : reverseOffsets;
+        const isReverse = direction === 1;
+        const cursor = new Int32Array(nAxles);
+        for (let p = 0; p < nSteps; p++) {
+            for (let s = 0; s < nSupports; s++) {
+                const r = rOffset + s;
+                const { poly } = truckPolynomialPair(
+                    r, steps[p], steps[p], 0, weights, offsets, nAxles, nodes, coeffs,
+                    nResponses, nElems, autoDLA, multiplier, axleFactor, isReverse,
+                    cursor, null, true, false, false, emptyGeometry, -1
+                );
+                const hi = poly[0] + udlMax[rOffset + s];
+                const lo = poly[1 * 4] + udlMin[rOffset + s];
+                const idx = p * nSupports + s;
+                if (hi > histMax[idx]) histMax[idx] = hi;
+                if (lo < histMin[idx]) histMin[idx] = lo;
+            }
+            truckSolves++;
+            if (p % 50 === 0) onProgress?.(0.85 + 0.15 * (direction * nSteps + p) / (nSteps * 2), `${caseLabel}: reaction curves ${p + 1}/${nSteps}`);
+        }
+    }
+    // Combine continuous optima with UDL envelopes
+    const optMax = new Float64Array(nSupports);
+    const optMin = new Float64Array(nSupports);
+    for (let s = 0; s < nSupports; s++) {
+        optMax[s] = maxima[rOffset + s] + udlMax[rOffset + s];
+        optMin[s] = minima[rOffset + s] + udlMin[rOffset + s];
+    }
+    // Add UDL to V/M/D optima (histories already include UDL)
+    // maxima/minima arrays are truck-only; final envelopes add UDL at packaging time.
+    return { maxima, minima, histMax, histMin, optMax, optMin, optGov, truckSolves };
+}
+
+export function debugTruckBest(
+    spans: Span[], axles: Axle[], config: AnalysisConfig, responseX: number, kind: 'moment' | 'shear' | 'deflection' | 'reaction' = 'moment'
+): { response: number; x: number; bestMax: number; govLeadMax: number; maskMax: number; baseMax: number; bestMin: number; govLeadMin: number; maskMin: number; baseMin: number } {
+    validateInputs({ spans, axles, config });
+    const dla = resolveDla(config);
+    const system = new BeamSystem(spans, config);
+    const nElems = system.nElems;
+    const nResponses = system.response.length;
+    const { coeffs } = buildInfluenceCache(system);
+    const nodes = system.xNodes;
+    let response = -1;
+    let x = responseX;
+    if (kind === 'moment') {
+        let bi = 0;
+        nodes.forEach((nx, i) => {
+            const dcur = Math.abs(nx - responseX);
+            const dbest = Math.abs(nodes[bi] - responseX);
+            if (dcur < dbest || (dcur === dbest && i > bi)) bi = i;
+        });
+        x = nodes[bi];
+        response = 2 * nElems + bi;
+    } else if (kind === 'deflection') {
+        let bi = 0;
+        nodes.forEach((nx, i) => { if (Math.abs(nx - responseX) < Math.abs(nodes[bi] - responseX)) bi = i; });
+        x = nodes[bi];
+        response = 3 * nElems + 1 + bi;
+    } else if (kind === 'shear') {
+        let bi = 0;
+        system.xShear.forEach((sx, i) => { if (Math.abs(sx - responseX) < Math.abs(system.xShear[bi] - responseX)) bi = i; });
+        x = system.xShear[bi];
+        response = bi;
+    } else {
+        let bi = 0;
+        system.supports.forEach((sx, i) => { if (Math.abs(sx - responseX) < Math.abs(system.supports[bi] - responseX)) bi = i; });
+        x = system.supports[bi];
+        response = 4 * nElems + 2 + bi;
+    }
+    const baseAxles = axles.map(a => a.load);
+    const spacings = axles.map(a => a.spacing);
+    const nAxles = axles.length;
+    const forwardWeights = [...baseAxles];
+    const forwardOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) forwardOffsets[i] = forwardOffsets[i - 1] + spacings[i - 1];
+    const reverseWeights = [...baseAxles].reverse();
+    const reverseOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) reverseOffsets[i] = reverseOffsets[i - 1] + spacings[nAxles - 1 - i];
+    const forwardGeometry = buildTruckGeometry(nodes, forwardOffsets, nAxles);
+    const reverseGeometry = buildTruckGeometry(nodes, reverseOffsets, nAxles);
+    const { knots, responseCoeffs } = prepareTruckResponse(response, nodes, coeffs, nElems, nResponses);
+    const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
+    const best = [0, 0];
+    const govLead = [0, 0];
+    const govMask = new Int32Array(2);
+    const govBase = [0, 0];
+    const govSide = new Int32Array(2);
+    truckResponseExtrema(response, forwardWeights, forwardOffsets, nAxles, nodes, knots, responseCoeffs,
+        forwardGeometry, dla.isAuto, dla.multiplier, axleFactor, false, best, govLead, govMask, govBase, govSide,
+        coeffs, nResponses, nElems);
+    truckResponseExtrema(response, reverseWeights, reverseOffsets, nAxles, nodes, knots, responseCoeffs,
+        reverseGeometry, dla.isAuto, dla.multiplier, axleFactor, true, best, govLead, govMask, govBase, govSide,
+        coeffs, nResponses, nElems);
+    return {
+        response, x, bestMax: best[0], govLeadMax: govLead[0], maskMax: govMask[0], baseMax: govBase[0],
+        bestMin: best[1], govLeadMin: govLead[1], maskMin: govMask[1], baseMin: govBase[1],
+    };
+}
+
+export function debugPointSweep(
+    spans: Span[], axles: Axle[], config: AnalysisConfig, responseX: number, step = 0.05
+): { x: number; continuousMax: number; densePointMax: number; denseLead: number; denseMask: number; denseBase: number } {
+    validateInputs({ spans, axles, config });
+    const dla = resolveDla(config);
+    const system = new BeamSystem(spans, config);
+    const nElems = system.nElems;
+    const nResponses = system.response.length;
+    const { coeffs } = buildInfluenceCache(system);
+    const nodes = system.xNodes;
+    let bi = 0;
+    nodes.forEach((nx, i) => {
+        const dcur = Math.abs(nx - responseX);
+        const dbest = Math.abs(nodes[bi] - responseX);
+        if (dcur < dbest || (dcur === dbest && i > bi)) bi = i;
+    });
+    const x = nodes[bi];
+    const response = 2 * nElems + bi;
+    const baseAxles = axles.map(a => a.load);
+    const spacings = axles.map(a => a.spacing);
+    const nAxles = axles.length;
+    const totalLength = nodes[nodes.length - 1];
+    const truckLength = spacings.slice(0, -1).reduce((s, v) => s + v, 0);
+    const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
+    const emptyGeometry: TruckGeometry = {
+        positions: [], midElement: new Int32Array(0), pointElement: new Int32Array(0),
+        z: new Float64Array(0), delta: new Float64Array(0), pointXi: new Float64Array(0), intervals: 0,
+    };
+    const cont = debugTruckBest(spans, axles, config, responseX, 'moment');
+    let densePointMax = -Infinity;
+    let denseLead = 0;
+    let denseMask = 0;
+    let denseBase = 0;
+    const dirs = [
+        { w: [...baseAxles], o: forwardOffsetsFor(spacings, nAxles), rev: false },
+        { w: [...baseAxles].reverse(), o: forwardOffsetsFor([...spacings].reverse(), nAxles), rev: true },
+    ];
+    // Note: reverse offsets need reversed spacings in reverse order; recompute properly below.
+    const fwdOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) fwdOffsets[i] = fwdOffsets[i - 1] + spacings[i - 1];
+    const revSpacings = [...spacings.slice(0, -1)].reverse();
+    const revOffsets = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) revOffsets[i] = revOffsets[i - 1] + (revSpacings[i - 1] ?? 0);
+    const revWeights = [...baseAxles].reverse();
+    for (let lead = -truckLength; lead <= totalLength + truckLength + 1e-9; lead += step) {
+        for (const [weights, offsets, isReverse] of [[forwardWeightsSafe(baseAxles), fwdOffsets, false], [revWeights, revOffsets, true]] as const) {
+            const cursor = new Int32Array(nAxles);
+            const { poly, masks, bases } = truckPolynomialPair(
+                response, lead, lead, 0, weights as unknown as ArrayLike<number>, offsets as unknown as ArrayLike<number>,
+                nAxles, nodes, coeffs, nResponses, nElems, dla.isAuto, dla.multiplier, axleFactor,
+                isReverse, cursor, null, true, false, false, emptyGeometry, -1
+            );
+            if (poly[0] > densePointMax) {
+                densePointMax = poly[0];
+                denseLead = lead;
+                denseMask = masks[0];
+                denseBase = bases[0];
+            }
+        }
+    }
+    void dirs;
+    return { x, continuousMax: cont.bestMax, densePointMax, denseLead, denseMask, denseBase };
+}
+
+function forwardOffsetsFor(spacings: number[], nAxles: number): number[] {
+    const o = new Array(nAxles).fill(0);
+    for (let i = 1; i < nAxles; i++) o[i] = o[i - 1] + (spacings[i - 1] ?? 0);
+    return o;
+}
+
+function forwardWeightsSafe(baseAxles: number[]): number[] {
+    return [...baseAxles];
+}
+
 export function analyzeBeam(
     request: AnalysisRequest, onProgress?: (progress: AnalysisProgress) => void
 ): AnalysisResults {
     const started = performance.now();
     validateInputs(request);
     const { spans, axles, config } = request;
+    const dla = resolveDla(config);
     onProgress?.({ fraction: 0, message: 'Factorizing beam stiffness...' });
     const system = new BeamSystem(spans, config);
+    const nElems = system.nElems;
+    const nSupports = system.supports.length;
+    const nResponses = system.response.length;
     const stepInfo = computeEffectiveIncrement(spans, axles, config.truckIncrement, config.nElemsPerSpan);
     const positions = buildTruckPositions(system.supports, axles, stepInfo.effective);
-    if (positions.length * system.supports.length > 2000000)
+    if (positions.length * nSupports > 2000000)
         throw new Error('Reaction histories exceed 2,000,000 ordinates per case. Reduce the span or axle count.');
-    const max = new Float64Array(system.response.length).fill(-Infinity);
-    const min = new Float64Array(system.response.length).fill(Infinity);
-    const udlMax = new Float64Array(system.response.length);
-    const udlMin = new Float64Array(system.response.length);
+    onProgress?.({ fraction: 0.02, message: 'Generating influence functions...' });
+    const { coeffs } = buildInfluenceCache(system);
     let udlSolves = 0;
+    const baseAxles = axles.map(a => a.load);
+    const spacings = axles.map(a => a.spacing);
+    const nAxles = axles.length;
+
+    const runCase = (
+        label: 'Truck' | 'Lane', axleFactor: number, wUdl: number,
+        autoDLA: boolean, multiplier: number
+    ) => {
+        const { max: udlMax, min: udlMin } = calculateUDLEnvelopes(coeffs, nElems, nResponses, system.lengths, wUdl);
+        if (wUdl > 0) udlSolves += spans.length; // span-equivalent reporting (influence zones are exact)
+        const env = runInfluenceTruckEnvelope(
+            axleFactor, autoDLA, multiplier, baseAxles, spacings, nAxles,
+            system.xNodes, nElems, nResponses, coeffs, positions, nSupports,
+            udlMax, udlMin,
+            (fraction, message) => onProgress?.({ fraction: 0.02 + fraction * (label === 'Truck' ? 0.49 : 0.49), message }),
+            label
+        );
+        // Final envelopes: continuous truck optima + UDL zones
+        const finalMax = new Float64Array(nResponses);
+        const finalMin = new Float64Array(nResponses);
+        for (let i = 0; i < nResponses; i++) {
+            finalMax[i] = env.maxima[i] + udlMax[i];
+            finalMin[i] = env.minima[i] + udlMin[i];
+        }
+        return { ...env, udlMax, udlMin, finalMax, finalMin };
+    };
+
+    type BuiltCase = ReturnType<typeof runCase> & { dlaAuto: boolean; dlaBase: number; dlaMultiplier: number; dlaUsed: number };
+    const built: Partial<Record<LoadCase, BuiltCase>> = {};
+    const progressShim = (f: number, m: string) => onProgress?.({ fraction: f, message: m });
+    void progressShim;
+    if (config.loadCase !== 'lane') {
+        // Uniform DLA (span-based auto × d, or override × d) applied to the
+        // whole truck: keeps the envelope smooth. Selected-axle
+        // placement-dependent DLA creates knife-edge jumps (an axle exactly at
+        // a support/root flips 40%↔30% on ~zero contribution), verified by
+        // dense point sweeps. Statics stay continuous-optimised + influence UDL.
+        const spanDla = computeAutoDlaInfo(spans, axles).dla;
+        const uniformBase = dla.isAuto ? spanDla : dla.base;
+        const uniformEffective = uniformBase * dla.multiplier;
+        const axleFactor = 1 + uniformEffective;
+        const t = runCase('Truck', axleFactor, 0, false, dla.multiplier);
+        built.truck = { ...t, dlaAuto: dla.isAuto, dlaBase: uniformBase, dlaMultiplier: dla.multiplier, dlaUsed: uniformEffective };
+    }
     if (config.loadCase !== 'truck') {
-        // Every load pattern is a sum of independent span responses. Choosing each
-        // positive/negative contribution gives exactly the same extrema as all 2^n patterns.
-        for (let s = 0; s < spans.length; s++) {
-            const response = system.udl(s, 9);
-            for (let i = 0; i < response.length; i++) {
-                udlMax[i] += Math.max(0, response[i]);
-                udlMin[i] += Math.min(0, response[i]);
-            }
-            udlSolves++;
-        }
+        const l = runCase('Lane', LANE_TRUCK_FACTOR, LANE_UDL, false, 1);
+        built.lane = { ...l, dlaAuto: false, dlaBase: 0, dlaMultiplier: 1, dlaUsed: 0 };
     }
-    const reactionMax = positions.map(() => new Float64Array(system.supports.length).fill(-Infinity));
-    const reactionMin = positions.map(() => new Float64Array(system.supports.length).fill(Infinity));
-    let truckSolves = 0;
-    for (const [directionIndex, direction] of [axles, reverseAxles(axles)].entries()) {
-        for (let p = 0; p < positions.length; p++) {
-            const response = system.truck(positions[p], direction);
-            for (let i = 0; i < response.length; i++) {
-                max[i] = Math.max(max[i], response[i]);
-                min[i] = Math.min(min[i], response[i]);
-            }
-            for (let s = 0; s < system.supports.length; s++) {
-                const value = response[system.reactionOffset + s];
-                reactionMax[p][s] = Math.max(reactionMax[p][s], value);
-                reactionMin[p][s] = Math.min(reactionMin[p][s], value);
-            }
-            truckSolves++;
-            if (p % 25 === 0) onProgress?.({
-                fraction: (directionIndex * positions.length + p) / (positions.length * 2),
-                message: `${directionIndex === 0 ? 'Forward' : 'Reverse'} truck sweep: ${positions[p].toFixed(2)}m`,
-            });
-        }
-    }
-    const dla = config.dlaOverride ?? computeAutoDlaInfo(spans, axles).dla;
-    const makeCase = (factor: number, lane: boolean): CaseResults => {
-        const hi = (i: number) => max[i] * factor + (lane ? udlMax[i] : 0);
-        const lo = (i: number) => min[i] * factor + (lane ? udlMin[i] : 0);
-        const points = (xs: number[], offset: number) =>
-            xs.map((x, i) => ({ x, max: hi(offset + i), min: lo(offset + i) }));
+
+    const makeCase = (b: BuiltCase): CaseResults => {
+        const shear: EnvelopePoint[] = system.xShear.map((x, i) => ({ x, max: b.finalMax[i], min: b.finalMin[i] }));
+        const moment: EnvelopePoint[] = system.xNodes.map((x, i) => ({ x, max: b.finalMax[2 * nElems + i], min: b.finalMin[2 * nElems + i] }));
+        const deflection: EnvelopePoint[] = system.xNodes.map((x, i) => ({ x, max: b.finalMax[3 * nElems + 1 + i], min: b.finalMin[3 * nElems + 1 + i] }));
         const reactionDiagrams = system.supports.map((_, s) =>
             positions.map((x, p) => ({
-                x, max: reactionMax[p][s] * factor + (lane ? udlMax[system.reactionOffset + s] : 0),
-                min: reactionMin[p][s] * factor + (lane ? udlMin[system.reactionOffset + s] : 0),
+                x, max: b.histMax[p * nSupports + s], min: b.histMin[p * nSupports + s],
             })));
-        const reactions = reactionDiagrams.map((diagram, s) => {
-            let governing = diagram[0];
-            let minimum = diagram[0].min;
-            for (const point of diagram) {
-                if (point.max > governing.max) governing = point;
-                minimum = Math.min(minimum, point.min);
+        const reactions: ReactionEnvelope[] = system.supports.map((x, s) => {
+            // Optimised continuous summary (VBA parity); govPos may lie off the sampled grid.
+            let min = Infinity;
+            for (let p = 0; p < positions.length; p++) {
+                const v = b.histMin[p * nSupports + s];
+                if (v < min) min = v;
             }
-            return { x: system.supports[s], max: governing.max, min: minimum, govPos: governing.x };
+            return { x, max: b.optMax[s], min, govPos: b.optGov[s] };
         });
         return {
-            shear: points(system.xShear, 0), moment: points(system.xNodes, system.momentOffset),
-            deflection: points(system.xNodes, system.deflectionOffset),
-            reactionDiagrams, reactions, dlaUsed: lane ? 0 : dla,
+            shear, moment, deflection, reactionDiagrams, reactions,
+            dlaUsed: b.dlaUsed, dlaAuto: b.dlaAuto, dlaBase: b.dlaBase, dlaMultiplier: b.dlaMultiplier,
         };
     };
+
     const cases: Partial<Record<LoadCase, CaseResults>> = {};
-    if (config.loadCase !== 'lane') cases.truck = makeCase(1 + dla, false);
-    if (config.loadCase !== 'truck') cases.lane = makeCase(0.8, true);
-    if (cases.truck && cases.lane) {
+    if (built.truck) cases.truck = makeCase(built.truck);
+    if (built.lane) cases.lane = makeCase(built.lane);
+    if (cases.truck && cases.lane && built.truck && built.lane) {
         const truck = cases.truck;
         const lane = cases.lane;
+        const bt = built.truck;
+        const bl = built.lane;
         const combine = (t: EnvelopePoint[], l: EnvelopePoint[]) =>
             t.map((p, i) => ({ x: p.x, max: Math.max(p.max, l[i].max), min: Math.min(p.min, l[i].min) }));
+        // Reaction histories: envelope of both cases per ordinate (VBA parity)
+        const reactionDiagrams = truck.reactionDiagrams.map((diagram, s) =>
+            diagram.map((p, idx) => ({
+                x: p.x,
+                max: Math.max(p.max, lane.reactionDiagrams[s][idx].max),
+                min: Math.min(p.min, lane.reactionDiagrams[s][idx].min),
+            })));
+        // Support summary: optimised maxima envelope (VBA: max of optimised, min of min)
+        const reactions = truck.reactions.map((p, s) => {
+            const lmax = lane.reactions[s].max;
+            const lmin = lane.reactions[s].min;
+            const useLane = lmax > p.max;
+            return {
+                x: p.x,
+                max: Math.max(p.max, lmax),
+                min: Math.min(p.min, lmin),
+                govPos: useLane ? lane.reactions[s].govPos : p.govPos,
+            };
+        });
         cases.envelope = {
             shear: combine(truck.shear, lane.shear),
             moment: combine(truck.moment, lane.moment),
             deflection: combine(truck.deflection, lane.deflection),
-            reactionDiagrams: truck.reactionDiagrams.map((diagram, s) => combine(diagram, lane.reactionDiagrams[s])),
-            reactions: truck.reactions.map((p, s) => ({
-                x: p.x, max: Math.max(p.max, lane.reactions[s].max), min: Math.min(p.min, lane.reactions[s].min),
-                govPos: lane.reactions[s].max > p.max ? lane.reactions[s].govPos : p.govPos,
-            })),
-            dlaUsed: dla,
+            reactionDiagrams,
+            reactions,
+            dlaUsed: bt.dlaUsed,
+            dlaAuto: bt.dlaAuto,
+            dlaBase: bt.dlaBase,
+            dlaMultiplier: bt.dlaMultiplier,
         };
+        void bl;
     }
     const selected = cases[config.loadCase];
     if (!selected) throw new Error('The selected load case was not calculated.');
     onProgress?.({ fraction: 1, message: 'Analysis complete.' });
+    let truckSolves = 0;
+    if (built.truck) truckSolves += built.truck.truckSolves;
+    if (built.lane) truckSolves += built.lane.truckSolves;
     return {
         ...selected, cases, loadCase: config.loadCase, spans: spans.map(s => ({ ...s })),
-        axles: axles.map(a => ({ ...a })), config: { ...config },
+        axles: axles.map(a => ({ ...a })), config: { ...config, dlaMultiplier: dla.multiplier },
         xNodes: system.xNodes, supportPositions: system.supports, truckPositions: positions,
         incrementUsed: stepInfo.effective, baseIncrement: config.truckIncrement,
         incrementReason: stepInfo.reason, elapsedMs: performance.now() - started,
