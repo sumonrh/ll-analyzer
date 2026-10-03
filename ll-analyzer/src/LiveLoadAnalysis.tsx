@@ -1,653 +1,25 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { Play, RotateCcw, Plus, Trash2, Settings, AlertCircle, Download } from 'lucide-react';
+import AnalysisWorker from './analysis.worker?worker&inline';
+import {
+    DEFAULT_SPANS, DEFAULT_AXLES, DEFAULT_CONFIG, MAX_AXLES,
+    computeAutoDlaInfo, computeEffectiveIncrement,
+} from './beam-engine';
+import type {
+    Span, Axle, AnalysisConfig, AnalysisResults, AnalysisResponse,
+    EnvelopePoint, ReactionEnvelope, LoadCase, CaseResults, AnalysisProgress,
+} from './beam-engine';
 
-// --- TYPES ---
-
-type Span = {
-    id: string;
-    length: number;
-};
-
-type Axle = {
-    id: string;
-    load: number;
-    spacing: number; // Spacing to the NEXT axle
-};
-
-type AnalysisConfig = {
-    E: number; // Pascal
-    I: number; // m^4
-    nElemsPerSpan: number;
-    truckIncrement: number;
-    loadCase: 'truck' | 'lane' | 'envelope';
-    dlaOverride?: number | null;
-};
-
-type EnvelopePoint = {
-    x: number;
-    max: number;
-    min: number;
-};
-
-type ReactionEnvelope = {
-    x: number;
-    max: number;
-    min: number;
-    govPos?: number; // truck lead position producing max reaction
-};
-
-type AnalysisResults = {
-    shear: EnvelopePoint[];
-    moment: EnvelopePoint[];
-    deflection: EnvelopePoint[];
-    xNodes: number[];
-    reactions: ReactionEnvelope[];
-    supportPositions: number[];
-    dlaUsed?: number;
-    incrementUsed?: number;
-    baseIncrement?: number;
-};
-
-// --- CONSTANTS ---
-
-const DEFAULT_SPANS: Span[] = [
-    { id: 's1', length: 20 },
-    { id: 's2', length: 25 },
-    { id: 's3', length: 20 },
-];
-
-const DEFAULT_AXLES: Axle[] = [
-    { id: 'a1', load: 50, spacing: 3.6 },
-    { id: 'a2', load: 125, spacing: 1.2 },
-    { id: 'a3', load: 125, spacing: 6.6 },
-    { id: 'a4', load: 175, spacing: 6.6 },
-    { id: 'a5', load: 150, spacing: 0 },
-];
-
-const MAX_PATTERN_SPANS = 12; // 2^n UDL patterns becomes prohibitive beyond this
-const MIN_SWEEP_STEP = 0.02; // m - floor to avoid runaway solve counts on tiny spans
-const MAX_SWEEP_STEPS = 6000; // per pass - cap to keep UI responsive on very long bridges
-
-// Adaptive moving-load step. A fixed 0.25m step can jump over entire elements on
-// short trestle spans (e.g. 4m/40 = 0.10m elements) and miss peaks between supports.
-// Effective step = min(base, minSpan/40, minElemLen, minAxleSpacing/8), floored and
-// capped so total uniform steps stay <= MAX_SWEEP_STEPS. Support alignments are
-// always added explicitly, so support peaks are exact regardless of step.
-export function computeEffectiveIncrement(
-    spans: Span[],
-    axles: Axle[],
-    baseIncrement: number,
-    nElemsPerSpan: number
-): { effective: number; reason: string; wasReduced: boolean } {
-    const lens = spans.map(s => s.length).filter(l => Number.isFinite(l) && l > 0);
-    if (lens.length === 0 || !Number.isFinite(baseIncrement) || baseIncrement <= 0) {
-        return { effective: baseIncrement, reason: '', wasReduced: false };
-    }
-    const minSpan = Math.min(...lens);
-    const totalLen = lens.reduce((a, b) => a + b, 0);
-    const minElem = minSpan / Math.max(2, nElemsPerSpan);
-    const gaps = axles.slice(0, -1).map(a => a.spacing).filter(s => Number.isFinite(s) && s > 0);
-    const minGap = gaps.length > 0 ? Math.min(...gaps) : Infinity;
-    const truckLen = axles.reduce((acc, a) => acc + (Number.isFinite(a.spacing) ? a.spacing : 0), 0);
-
-    let eff = baseIncrement;
-    let control = 'base setting';
-    const consider = (cand: number, label: string) => {
-        if (Number.isFinite(cand) && cand > 0 && cand < eff) {
-            eff = cand;
-            control = label;
-        }
+type SheetJs = {
+    utils: {
+        book_new(): object;
+        json_to_sheet(rows: object[]): object;
+        book_append_sheet(workbook: object, sheet: object, name: string): void;
     };
-    consider(minSpan / 40, `short span control (minSpan ${minSpan.toFixed(2)}m / 40)`);
-    consider(minElem, `element control (minElem ${minElem.toFixed(3)}m)`);
-    if (Number.isFinite(minGap)) consider(minGap / 8, `axle-spacing control (minGap ${minGap.toFixed(2)}m / 8)`);
-
-    if (eff < MIN_SWEEP_STEP) {
-        eff = MIN_SWEEP_STEP;
-        control = `minimum step floor (${MIN_SWEEP_STEP.toFixed(2)}m)`;
-    }
-    // Cap total uniform steps for very long bridges / tiny steps
-    const sweepLen = totalLen + 2 * truckLen;
-    if (sweepLen / eff > MAX_SWEEP_STEPS) {
-        eff = sweepLen / MAX_SWEEP_STEPS;
-        control = `step-count cap (${MAX_SWEEP_STEPS} steps over ${sweepLen.toFixed(1)}m sweep)`;
-    }
-    // Round up to 5mm to avoid pathological 0.09333... steps; rounding up never refines beyond need
-    eff = Math.ceil(eff * 200) / 200;
-    if (eff > baseIncrement) eff = baseIncrement;
-    const wasReduced = eff < baseIncrement - 1e-9;
-    return { effective: eff, reason: wasReduced ? control : '', wasReduced };
-}
-
-const DEFAULT_CONFIG: AnalysisConfig = {
-    E: 200000000000,
-    I: 0.005,
-    nElemsPerSpan: 40,
-    truckIncrement: 0.25,
-    loadCase: 'truck',
-    dlaOverride: null,
+    writeFile(workbook: object, name: string): void;
 };
-
-// --- FEM ENGINE (Ported from VBA) ---
-
-class BeamFEM {
-    private config: AnalysisConfig;
-    private spans: Span[];
-    private axles: Axle[];
-
-    constructor(spans: Span[], axles: Axle[], config: AnalysisConfig) {
-        this.spans = spans;
-        this.axles = axles;
-        this.config = config;
-    }
-
-    private static maxAxlesOnLength(spanLen: number, axles: Axle[]): number {
-        let maxCount = 1;
-        for (let i = 0; i < axles.length; i++) {
-            let count = 1;
-            let cumulativeDist = 0;
-            for (let j = i; j < axles.length - 1; j++) {
-                cumulativeDist += axles[j].spacing;
-                if (cumulativeDist <= spanLen + 0.000001) {
-                    count++;
-                } else {
-                    break;
-                }
-            }
-            if (count > maxCount) maxCount = count;
-        }
-        return maxCount;
-    }
-
-    private static dlaForAxleCount(n: number): number {
-        if (n <= 1) return 0.40;
-        if (n === 2) return 0.30;
-        return 0.25;
-    }
-
-    private calculateAutoDla(): number {
-        // Conservative: evaluate DLA per span and take the maximum.
-        // Using only maxSpan would under-apply DLA to short spans.
-        let worst = 0.25;
-        for (const span of this.spans) {
-            const n = BeamFEM.maxAxlesOnLength(span.length, this.axles);
-            const d = BeamFEM.dlaForAxleCount(n);
-            if (d > worst) worst = d;
-        }
-        return worst;
-    }
-
-    public runAnalysis(): AnalysisResults {
-        const { E, I, nElemsPerSpan, truckIncrement, loadCase } = this.config;
-        // --- Input validation (mirrors VBA MainAnalysis guards) ---
-        if (!this.spans || this.spans.length < 1) throw new Error('At least one span is required.');
-        for (let i = 0; i < this.spans.length; i++) {
-            if (!Number.isFinite(this.spans[i].length) || this.spans[i].length <= 0)
-                throw new Error(`Span ${i + 1} length must be greater than zero.`);
-        }
-        if (!Number.isFinite(E) || E <= 0) throw new Error('Elastic modulus E must be greater than zero.');
-        if (!Number.isFinite(I) || I <= 0) throw new Error('Moment of inertia I must be greater than zero.');
-        if (!Number.isFinite(nElemsPerSpan) || nElemsPerSpan < 2) throw new Error('Elements per span must be >= 2.');
-        if (!Number.isFinite(truckIncrement) || truckIncrement <= 0) throw new Error('Truck increment must be > 0.');
-        if (!this.axles || this.axles.length < 1) throw new Error('At least one axle is required.');
-        for (let i = 0; i < this.axles.length; i++) {
-            if (!Number.isFinite(this.axles[i].load) || this.axles[i].load < 0)
-                throw new Error(`Axle ${i + 1} load must be >= 0.`);
-            if (i < this.axles.length - 1 && (!Number.isFinite(this.axles[i].spacing) || this.axles[i].spacing < 0))
-                throw new Error(`Axle ${i + 1} spacing must be >= 0.`);
-        }
-        const numSpans = this.spans.length;
-        const nTotalElems = numSpans * nElemsPerSpan;
-        const nNodes = nTotalElems + 1;
-        const nDOF = nNodes * 2;
-
-        // 1. Mesh Generation
-        const elemLens: number[] = [];
-        const xNodes: number[] = [0];
-        let currentX = 0;
-
-        // Stepped Shear Mesh (Start/End of each element)
-        const xShear: number[] = [];
-
-        for (const span of this.spans) {
-            const le = span.length / nElemsPerSpan;
-            for (let i = 0; i < nElemsPerSpan; i++) {
-                xShear.push(currentX);       // Start of elem
-                currentX += le;
-                xShear.push(currentX);       // End of elem
-
-                xNodes.push(currentX);
-                elemLens.push(le);
-            }
-        }
-
-        // 2. Global Stiffness Matrix
-        const K_Global: number[][] = Array(nDOF).fill(0).map(() => Array(nDOF).fill(0));
-
-        for (let i = 0; i < nTotalElems; i++) {
-            const le = elemLens[i];
-            const coeff = (E * I) / Math.pow(le, 3);
-            const k_loc = [
-                [12, 6 * le, -12, 6 * le],
-                [6 * le, 4 * le * le, -6 * le, 2 * le * le],
-                [-12, -6 * le, 12, -6 * le],
-                [6 * le, 2 * le * le, -6 * le, 4 * le * le]
-            ];
-
-            const mapDOFs = [i * 2, i * 2 + 1, (i + 1) * 2, (i + 1) * 2 + 1];
-
-            for (let r = 0; r < 4; r++) {
-                for (let c = 0; c < 4; c++) {
-                    K_Global[mapDOFs[r]][mapDOFs[c]] += k_loc[r][c] * coeff;
-                }
-            }
-        }
-
-        // 3. Boundary Conditions (Pins) and Support Positions
-        const constrained: boolean[] = Array(nDOF).fill(false);
-        const supportPositions: number[] = [0]; // First support at x=0
-        let nodeIdx = 0;
-        constrained[0] = true; // First node pinned Y
-        let cumLen = 0;
-        for (let i = 0; i < numSpans; i++) {
-            cumLen += this.spans[i].length;
-            supportPositions.push(cumLen);
-            nodeIdx += nElemsPerSpan;
-            constrained[nodeIdx * 2] = true; // End of span pinned Y
-        }
-
-        // 4. Envelope factory (shear: 2 pts/elem stepped; moment/deflection: nodal)
-        const initEnvelope = (len: number) => Array(len).fill(0).map(() => ({ max: -Infinity, min: Infinity }));
-
-        // Reaction envelopes (one per support) - filled by runSingleCase()
-        const autoDla = this.calculateAutoDla();
-        const dla = (this.config.dlaOverride !== undefined && this.config.dlaOverride !== null)
-            ? this.config.dlaOverride
-            : autoDla;
-        if (!Number.isFinite(dla) || dla < 0) throw new Error('DLA must be >= 0.');
-
-        const baseAxles: Axle[] = this.axles.map(a => ({ ...a })); // deep copy, never mutate this.axles
-        const spanLengths = this.spans.map(s => s.length);
-        // Adaptive sweep step: fixed 0.25m skips elements on short trestle spans.
-        const { effective: step } = computeEffectiveIncrement(this.spans, this.axles, truckIncrement, nElemsPerSpan);
-
-        type UdlEnvs = {
-            Vmax: number[]; Vmin: number[];
-            Mmax: number[]; Mmin: number[];
-            Dmax: number[]; Dmin: number[];
-            Rmax: number[]; Rmin: number[];
-        };
-
-        // Patterned lane-UDL envelopes (2^n span patterns, VBA CalculateUDLEnvelopes parity).
-        // All-spans-loaded alone misses alternate-span governing maxima, so enumerate patterns.
-        const calculateUdlEnvelopes = (w_udl: number): UdlEnvs => {
-            const nShear = nTotalElems * 2;
-            const Vmax = Array(nShear).fill(-Infinity);
-            const Vmin = Array(nShear).fill(Infinity);
-            const Mmax = Array(nNodes).fill(-Infinity);
-            const Mmin = Array(nNodes).fill(Infinity);
-            const Dmax = Array(nNodes).fill(-Infinity);
-            const Dmin = Array(nNodes).fill(Infinity);
-            const Rmax = Array(supportPositions.length).fill(-Infinity);
-            const Rmin = Array(supportPositions.length).fill(Infinity);
-            if (!(w_udl > 0)) {
-                return {
-                    Vmax: Array(nShear).fill(0), Vmin: Array(nShear).fill(0),
-                    Mmax: Array(nNodes).fill(0), Mmin: Array(nNodes).fill(0),
-                    Dmax: Array(nNodes).fill(0), Dmin: Array(nNodes).fill(0),
-                    Rmax: Array(supportPositions.length).fill(0), Rmin: Array(supportPositions.length).fill(0),
-                };
-            }
-            if (numSpans > MAX_PATTERN_SPANS)
-                throw new Error(`Lane load patterning evaluates 2^n patterns and is limited to ${MAX_PATTERN_SPANS} spans.`);
-            const nPatterns = 1 << numSpans;
-            for (let p = 0; p < nPatterns; p++) {
-                const F_UDL = Array(nDOF).fill(0);
-                const elemLoads_UDL = Array.from({ length: nTotalElems }, () => [0, 0, 0, 0]);
-                let elemCounter = 0;
-                for (let s = 0; s < numSpans; s++) {
-                    const isLoaded = ((p >> s) & 1) === 1;
-                    const le = spanLengths[s] / nElemsPerSpan;
-                    if (isLoaded) {
-                        const Fy = -w_udl * le / 2 * 1000;
-                        const Mom = -w_udl * le * le / 12 * 1000;
-                        for (let e = 0; e < nElemsPerSpan; e++) {
-                            const nI = elemCounter * 2;
-                            const nJ = (elemCounter + 1) * 2;
-                            F_UDL[nI] += Fy;
-                            F_UDL[nI + 1] += Mom;
-                            F_UDL[nJ] += Fy;
-                            F_UDL[nJ + 1] -= Mom;
-                            elemLoads_UDL[elemCounter][0] = Fy;
-                            elemLoads_UDL[elemCounter][1] = Mom;
-                            elemLoads_UDL[elemCounter][2] = Fy;
-                            elemLoads_UDL[elemCounter][3] = -Mom;
-                            elemCounter++;
-                        }
-                    } else {
-                        elemCounter += nElemsPerSpan;
-                    }
-                }
-                const U_UDL = solveFactored(F_UDL);
-                const forces = this.calculateForces(U_UDL, nTotalElems, elemLens, E, I, K_Global, F_UDL, constrained, nElemsPerSpan, numSpans, elemLoads_UDL);
-                for (let i = 0; i < forces.v.length; i++) {
-                    if (forces.v[i] > Vmax[i]) Vmax[i] = forces.v[i];
-                    if (forces.v[i] < Vmin[i]) Vmin[i] = forces.v[i];
-                }
-                for (let i = 0; i < forces.m.length; i++) {
-                    if (forces.m[i] > Mmax[i]) Mmax[i] = forces.m[i];
-                    if (forces.m[i] < Mmin[i]) Mmin[i] = forces.m[i];
-                    if (forces.d[i] > Dmax[i]) Dmax[i] = forces.d[i];
-                    if (forces.d[i] < Dmin[i]) Dmin[i] = forces.d[i];
-                }
-                for (let s = 0; s < forces.reactions.length; s++) {
-                    if (forces.reactions[s] > Rmax[s]) Rmax[s] = forces.reactions[s];
-                    if (forces.reactions[s] < Rmin[s]) Rmin[s] = forces.reactions[s];
-                }
-            }
-            return { Vmax, Vmin, Mmax, Mmin, Dmax, Dmin, Rmax, Rmin };
-        };
-
-        // 4b. Factorize reduced stiffness matrix once into LU for O(n^2) solve per position
-        const freeMap: number[] = [];
-        for (let i = 0; i < nDOF; i++) {
-            if (!constrained[i]) freeMap.push(i);
-        }
-        const nFree = freeMap.length;
-        if (nFree < 1) throw new Error('The model has no free degrees of freedom.');
-        const LU: number[][] = Array(nFree).fill(0).map(() => Array(nFree).fill(0));
-        for (let i = 0; i < nFree; i++) {
-            for (let j = 0; j < nFree; j++) {
-                LU[i][j] = K_Global[freeMap[i]][freeMap[j]];
-            }
-        }
-        // Doolittle LU without pivoting (reduced beam matrix is SPD). Guard zero pivots.
-        for (let k = 0; k < nFree - 1; k++) {
-            if (Math.abs(LU[k][k]) < 1e-12) throw new Error('Singular stiffness matrix - check span lengths and supports.');
-            for (let i = k + 1; i < nFree; i++) {
-                const factor = LU[i][k] / LU[k][k];
-                LU[i][k] = factor;
-                for (let j = k + 1; j < nFree; j++) {
-                    LU[i][j] -= factor * LU[k][j];
-                }
-            }
-        }
-        if (Math.abs(LU[nFree - 1][nFree - 1]) < 1e-12) throw new Error('Singular stiffness matrix - check span lengths and supports.');
-
-        const solveFactored = (F: number[]): number[] => {
-            const y: number[] = Array(nFree);
-            for (let i = 0; i < nFree; i++) y[i] = F[freeMap[i]];
-            for (let i = 1; i < nFree; i++) {
-                let sum = 0;
-                for (let j = 0; j < i; j++) sum += LU[i][j] * y[j];
-                y[i] -= sum;
-            }
-            for (let i = nFree - 1; i >= 0; i--) {
-                let sum = 0;
-                for (let j = i + 1; j < nFree; j++) sum += LU[i][j] * y[j];
-                if (Math.abs(LU[i][i]) < 1e-12) throw new Error('Singular stiffness matrix during solve.');
-                y[i] = (y[i] - sum) / LU[i][i];
-            }
-            const U_Full = Array(nDOF).fill(0);
-            for (let i = 0; i < nFree; i++) U_Full[freeMap[i]] = y[i];
-            return U_Full;
-        };
-
-        // 5-6. Single live-load case envelope (truck sweep + patterned UDL superposition).
-        // VBA parity: Max uses truck+UDL_Max, Min uses truck+UDL_Min (not a single UDL value),
-        // and reactions include UDL contributions.
-        const runSingleCase = (factoredAxles: Axle[], w_udl: number) => {
-            const udl = calculateUdlEnvelopes(w_udl);
-            const shear = initEnvelope(nTotalElems * 2).map((p, i) => ({ ...p, x: xShear[i] }));
-            const moment = initEnvelope(nNodes).map((p, i) => ({ ...p, x: xNodes[i] }));
-            const deflect = initEnvelope(nNodes).map((p, i) => ({ ...p, x: xNodes[i] }));
-            const react: ReactionEnvelope[] = supportPositions.map(x => ({ x, max: -Infinity, min: Infinity, govPos: 0 }));
-
-            const fwdAxles = factoredAxles.map(a => ({ ...a }));
-            // Deep-clone + reverse spacings (VBA revAxles parity). Never mutate fwdAxles via shared refs.
-            const revAxles = fwdAxles.map(a => ({ ...a })).reverse();
-            for (let i = 0; i < revAxles.length - 1; i++) {
-                revAxles[i].spacing = fwdAxles[fwdAxles.length - 2 - i].spacing;
-            }
-            if (revAxles.length > 0) revAxles[revAxles.length - 1].spacing = 0;
-
-            const truckLen = fwdAxles.reduce((acc, a) => acc + a.spacing, 0);
-            const totalLen = xNodes[xNodes.length - 1];
-            const startPos = -truckLen;
-            const endPos = totalLen + truckLen;
-
-            const runPass = (axles: Axle[]) => {
-                const posSet = new Set<number>();
-                for (let pos = startPos; pos <= endPos + 0.000001; pos += step) {
-                    posSet.add(Math.round(pos * 100000) / 100000);
-                }
-                // Exact support alignments so axles land directly on every support
-                for (const suppX of supportPositions) {
-                    let dist = 0;
-                    for (let k = 0; k < axles.length; k++) {
-                        const lead = suppX + dist;
-                        if (lead >= startPos - 0.001 && lead <= endPos + 0.001) {
-                            posSet.add(Math.round(lead * 100000) / 100000);
-                        }
-                        if (k < axles.length - 1) dist += axles[k].spacing;
-                    }
-                }
-                const sweepPositions = Array.from(posSet).sort((a, b) => a - b);
-
-                for (const pos of sweepPositions) {
-                    const F = Array(nDOF).fill(0);
-                    const elemLoads = Array.from({ length: nTotalElems }, () => [0, 0, 0, 0]);
-
-                    let axPos = pos;
-                    this.applyPointLoad(F, elemLoads, axPos, axles[0].load, elemLens, xNodes);
-                    for (let k = 0; k < axles.length - 1; k++) {
-                        axPos -= axles[k].spacing;
-                        this.applyPointLoad(F, elemLoads, axPos, axles[k + 1].load, elemLens, xNodes);
-                    }
-
-                    const U = solveFactored(F);
-                    const { v, m, d, reactions } = this.calculateForces(U, nTotalElems, elemLens, E, I, K_Global, F, constrained, nElemsPerSpan, numSpans, elemLoads);
-
-                    for (let i = 0; i < v.length; i++) {
-                        const hi = v[i] + udl.Vmax[i];
-                        if (hi > shear[i].max) shear[i].max = hi;
-                        const lo = v[i] + udl.Vmin[i];
-                        if (lo < shear[i].min) shear[i].min = lo;
-                    }
-                    for (let i = 0; i < m.length; i++) {
-                        const hiM = m[i] + udl.Mmax[i];
-                        if (hiM > moment[i].max) moment[i].max = hiM;
-                        const loM = m[i] + udl.Mmin[i];
-                        if (loM < moment[i].min) moment[i].min = loM;
-                        const hiD = d[i] + udl.Dmax[i];
-                        if (hiD > deflect[i].max) deflect[i].max = hiD;
-                        const loD = d[i] + udl.Dmin[i];
-                        if (loD < deflect[i].min) deflect[i].min = loD;
-                    }
-                    for (let i = 0; i < reactions.length; i++) {
-                        const hiR = reactions[i] + udl.Rmax[i];
-                        if (hiR > react[i].max) { react[i].max = hiR; react[i].govPos = pos; }
-                        const loR = reactions[i] + udl.Rmin[i];
-                        if (loR < react[i].min) react[i].min = loR;
-                    }
-                }
-            };
-
-            runPass(fwdAxles);
-            runPass(revAxles);
-            return { shear, moment, deflect, react };
-        };
-
-        // DLA applies to truck-only axle loads. Lane load carries NO DLA
-        // (neither the 0.8 truck portion nor the UDL).
-        const truckAxles = baseAxles.map(a => ({ ...a, load: a.load * (1 + dla) }));
-        const laneAxles = baseAxles.map(a => ({ ...a, load: a.load * 0.8 }));
-        const LANE_UDL = 9; // kN/m
-
-        if (loadCase === 'truck') {
-            const r = runSingleCase(truckAxles, 0);
-            return { shear: r.shear, moment: r.moment, deflection: r.deflect, xNodes, reactions: r.react, supportPositions, dlaUsed: dla, incrementUsed: step, baseIncrement: truckIncrement };
-        }
-        if (loadCase === 'lane') {
-            const r = runSingleCase(laneAxles, LANE_UDL);
-            return { shear: r.shear, moment: r.moment, deflection: r.deflect, xNodes, reactions: r.react, supportPositions, dlaUsed: 0, incrementUsed: step, baseIncrement: truckIncrement };
-        }
-        // envelope: governing of truck-only and lane cases
-        const t = runSingleCase(truckAxles, 0);
-        const l = runSingleCase(laneAxles, LANE_UDL);
-        const shear = t.shear.map((p, i) => ({ x: p.x, max: Math.max(p.max, l.shear[i].max), min: Math.min(p.min, l.shear[i].min) }));
-        const moment = t.moment.map((p, i) => ({ x: p.x, max: Math.max(p.max, l.moment[i].max), min: Math.min(p.min, l.moment[i].min) }));
-        const deflection = t.deflect.map((p, i) => ({ x: p.x, max: Math.max(p.max, l.deflect[i].max), min: Math.min(p.min, l.deflect[i].min) }));
-        const reactions: ReactionEnvelope[] = t.react.map((p, i) => ({
-            x: p.x,
-            max: Math.max(p.max, l.react[i].max),
-            min: Math.min(p.min, l.react[i].min),
-            govPos: (l.react[i].max > p.max ? l.react[i].govPos : p.govPos) ?? 0,
-        }));
-        return { shear, moment, deflection, xNodes, reactions, supportPositions, dlaUsed: dla, incrementUsed: step, baseIncrement: truckIncrement };
-    }
-
-    private applyPointLoad(F: number[], elemLoads: number[][], pos: number, mag: number, elemLens: number[], xNodes: number[]) {
-        const totalLen = xNodes[xNodes.length - 1];
-        if (pos < -0.0001 || pos > totalLen + 0.0001) return;
-        if (pos < 0) pos = 0;
-        if (pos > totalLen) pos = totalLen;
-
-        // Find element
-        let elemIdx = -1;
-        let localX = 0;
-
-        // Quick search
-        for (let i = 0; i < elemLens.length; i++) {
-            if (pos <= xNodes[i + 1] + 0.000001) {
-                elemIdx = i;
-                localX = pos - xNodes[i];
-                break;
-            }
-        }
-        if (elemIdx === -1) elemIdx = elemLens.length - 1;
-
-        const le = elemLens[elemIdx];
-        const xi = localX / le;
-
-        // Hermite Shape Functions
-        const N1 = 1 - 3 * xi * xi + 2 * xi * xi * xi;
-        const N2 = le * (xi - 2 * xi * xi + xi * xi * xi);
-        const N3 = 3 * xi * xi - 2 * xi * xi * xi;
-        const N4 = le * (-xi * xi + xi * xi * xi);
-
-        const dofI = elemIdx * 2;
-        const dofJ = (elemIdx + 1) * 2;
-
-        const f0 = -mag * N1 * 1000;
-        const f1 = -mag * N2 * 1000;
-        const f2 = -mag * N3 * 1000;
-        const f3 = -mag * N4 * 1000;
-
-        F[dofI] += f0;
-        F[dofI + 1] += f1;
-        F[dofJ] += f2;
-        F[dofJ + 1] += f3;
-
-        if (elemLoads && elemLoads[elemIdx]) {
-            elemLoads[elemIdx][0] += f0;
-            elemLoads[elemIdx][1] += f1;
-            elemLoads[elemIdx][2] += f2;
-            elemLoads[elemIdx][3] += f3;
-        }
-    }
-
-    private calculateForces(
-        U: number[],
-        nElems: number,
-        elemLens: number[],
-        E: number,
-        I: number,
-        K_Global: number[][],
-        F: number[],
-        _constrained: boolean[],
-        nElemsPerSpan: number,
-        numSpans: number,
-        elemLoads?: number[][]
-    ) {
-        const v: number[] = [];
-        const m: number[] = Array(nElems + 1).fill(0);
-        const d: number[] = Array(nElems + 1).fill(0);
-        const elemForces = [];
-
-        // Element forces
-        for (let e = 0; e < nElems; e++) {
-            const le = elemLens[e];
-            const coeff = (E * I) / Math.pow(le, 3);
-            const u_loc = [U[e * 2], U[e * 2 + 1], U[(e + 1) * 2], U[(e + 1) * 2 + 1]];
-
-            const k_loc = [
-                [12, 6 * le, -12, 6 * le],
-                [6 * le, 4 * le * le, -6 * le, 2 * le * le],
-                [-12, -6 * le, 12, -6 * le],
-                [6 * le, 2 * le * le, -6 * le, 4 * le * le]
-            ];
-
-            const f_loc = [0, 0, 0, 0];
-            for (let r = 0; r < 4; r++) {
-                for (let c = 0; c < 4; c++) {
-                    f_loc[r] += k_loc[r][c] * coeff * u_loc[c];
-                }
-                if (elemLoads && elemLoads[e]) {
-                    f_loc[r] -= elemLoads[e][r];
-                }
-            }
-            elemForces.push(f_loc);
-
-            // Fill Shear (Stepped)
-            v.push(f_loc[0] / 1000);      // Left edge
-            v.push(-f_loc[2] / 1000);     // Right edge
-        }
-
-        // Nodal Averaging for Moment
-        for (let n = 0; n <= nElems; n++) {
-            d[n] = U[n * 2];
-
-            let valM = 0;
-            if (n === 0) {
-                valM = elemForces[0][1];
-            } else if (n === nElems) {
-                valM = -elemForces[nElems - 1][3];
-            } else {
-                const M_left = -elemForces[n - 1][3];
-                const M_right = elemForces[n][1];
-                valM = (M_left + M_right) / 2;
-            }
-            m[n] = valM / 1000;
-            m[n] = -m[n]; // Flip for convention
-        }
-
-        // Calculate Reactions at Supports (R = K*U - F at constrained DOFs)
-        const nDOF = U.length;
-        const reactions: number[] = [];
-
-        // Get support node indices
-        const supportNodes: number[] = [0]; // First support at node 0
-        let nodeIdx = 0;
-        for (let i = 0; i < numSpans; i++) {
-            nodeIdx += nElemsPerSpan;
-            supportNodes.push(nodeIdx);
-        }
-
-        // Calculate reaction at each support node. R = K*U - F is already upward
-        // positive (verified: central 100kN on 20m SSB gives +50kN each). VBA parity.
-        for (const node of supportNodes) {
-            const dof = node * 2; // Vertical DOF
-            let reaction = 0;
-            for (let j = 0; j < nDOF; j++) {
-                reaction += K_Global[dof][j] * U[j];
-            }
-            reaction -= F[dof];
-            reactions.push(reaction / 1000); // N -> kN, upward positive
-        }
-
-        return { v, m, d, reactions };
-    }
+declare global {
+    interface Window { XLSX?: SheetJs }
 }
 
 // --- COMPONENTS ---
@@ -684,15 +56,17 @@ const EnvelopeChart = ({
     title,
     unit,
     color,
-    flipY = false
+    flipY = false,
+    xAxisTitle = 'Span position (m)'
 }: {
-    data: any[],
-    dataKeyMax: string,
-    dataKeyMin: string,
+    data: EnvelopePoint[],
+    dataKeyMax: 'max',
+    dataKeyMin: 'min',
     title: string,
     unit: string,
     color: string,
-    flipY?: boolean
+    flipY?: boolean,
+    xAxisTitle?: string
 }) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const [width, setWidth] = useState(600);
@@ -706,10 +80,14 @@ const EnvelopeChart = ({
     } | null>(null);
 
     useEffect(() => {
-        if (containerRef.current) setWidth(containerRef.current.clientWidth);
-        const handleResize = () => containerRef.current && setWidth(containerRef.current.clientWidth);
-        window.addEventListener('resize', handleResize);
-        return () => window.removeEventListener('resize', handleResize);
+        const container = containerRef.current;
+        if (!container) return;
+        const observer = new ResizeObserver(entries => {
+            const measured = entries[0].contentRect.width;
+            if (measured > 0) setWidth(measured);
+        });
+        observer.observe(container);
+        return () => observer.disconnect();
     }, []);
 
     if (!data || data.length === 0) return <div className="h-[300px] flex items-center justify-center text-gray-400" > No Data </div>;
@@ -925,7 +303,7 @@ const EnvelopeChart = ({
                     fontWeight="500"
                     fill="#374151"
                 >
-                    Length(m)
+                    {xAxisTitle}
                 </text>
 
                 <text
@@ -1036,6 +414,55 @@ const EnvelopeChart = ({
             <div className="flex justify-center gap-6 mt-2 text-sm" >
                 <div className="flex items-center" > <div className="w-4 h-0.5 bg-[color:var(--color)] mr-2" style={{ backgroundColor: color }}> </div> Max Envelope</div >
                 <div className="flex items-center" > <div className="w-4 h-0.5 bg-red-500 mr-2 border-dashed border-t-2 border-red-500" > </div> Min Envelope</div >
+            </div>
+        </div>
+    );
+};
+
+const AllSupportsChart = ({ diagrams }: { diagrams: EnvelopePoint[][] }) => {
+    if (diagrams.length === 0 || diagrams[0].length === 0) return null;
+    const colors = ['#2563eb', '#059669', '#9333ea', '#ea580c', '#0891b2', '#be123c'];
+    const xMin = diagrams[0][0].x;
+    const xMax = diagrams[0][diagrams[0].length - 1].x;
+    let yMin = 0;
+    let yMax = 0;
+    for (const diagram of diagrams) {
+        for (const point of diagram) {
+            yMin = Math.min(yMin, point.max);
+            yMax = Math.max(yMax, point.max);
+        }
+    }
+    const margin = (yMax - yMin) * 0.1 || 1;
+    yMin -= margin;
+    yMax += margin;
+    const sx = (x: number) => 70 + (x - xMin) / (xMax - xMin) * 900;
+    const sy = (y: number) => 230 - (y - yMin) / (yMax - yMin) * 200;
+    return (
+        <div className="bg-white rounded-lg border border-gray-200 p-4 mb-6">
+            <h3 className="text-lg font-semibold">All Supports Reaction Diagram</h3>
+            <p className="text-xs text-gray-500">Maximum reaction at each truck position, enveloped over both travel directions.</p>
+            <svg viewBox="0 0 1000 285" className="w-full" role="img" aria-label="All supports reaction diagram">
+                {calculateTicks(yMin, yMax, 5).map(value => (
+                    <g key={value}>
+                        <line x1="70" x2="970" y1={sy(value)} y2={sy(value)} stroke="#e5e7eb" />
+                        <text x="60" y={sy(value) + 4} textAnchor="end" fontSize="12">{value}</text>
+                    </g>
+                ))}
+                {calculateTicks(xMin, xMax, 8).map(value => (
+                    <text key={value} x={sx(value)} y="250" textAnchor="middle" fontSize="12">{value}</text>
+                ))}
+                <line x1="70" x2="970" y1={sy(0)} y2={sy(0)} stroke="#9ca3af" />
+                {diagrams.map((diagram, s) => (
+                    <path key={s} d={diagram.map((p, i) => `${i ? 'L' : 'M'} ${sx(p.x)} ${sy(p.max)}`).join(' ')}
+                        fill="none" stroke={colors[s % colors.length]} strokeWidth="2">
+                        <title>Support {s + 1}</title>
+                    </path>
+                ))}
+                <text x="520" y="275" textAnchor="middle" fontSize="13">Truck lead position (m)</text>
+                <text x="15" y="135" transform="rotate(-90 15 135)" textAnchor="middle" fontSize="13">Reaction (kN)</text>
+            </svg>
+            <div className="flex flex-wrap gap-4 justify-center text-xs">
+                {diagrams.map((_, s) => <span key={s} style={{ color: colors[s % colors.length] }}>Support {s + 1}</span>)}
             </div>
         </div>
     );
@@ -1341,53 +768,20 @@ const BeamReactionDiagram = ({
     );
 };
 
-// Helper to calculate automated DLA based on CSA S6-19 Cl. 3.8.4.5 and span arrangement.
-// Conservative: evaluates each span and governs with the highest DLA (short spans control).
-export function computeAutoDlaInfo(spans: Span[], axles: Axle[]): {
-    dla: number;
-    axleCount: number;
-    maxSpan: number;
-    desc: string;
-} {
-    const maxSpan = Math.max(...spans.map(s => s.length), 0);
-    const countOn = (len: number) => {
-        let best = 1;
-        for (let i = 0; i < axles.length; i++) {
-            let count = 1;
-            let cum = 0;
-            for (let j = i; j < axles.length - 1; j++) {
-                cum += axles[j].spacing;
-                if (cum <= len + 0.000001) count++;
-                else break;
-            }
-            if (count > best) best = count;
-        }
-        return best;
-    };
-    const dlaFor = (n: number) => (n <= 1 ? 0.40 : n === 2 ? 0.30 : 0.25);
-    let dla = 0.25;
-    let govCount = 3;
-    for (const s of spans) {
-        const n = countOn(s.length);
-        const d = dlaFor(n);
-        if (d > dla) {
-            dla = d;
-            govCount = n;
-        }
-    }
-    let desc = '≥ 3 axles on span';
-    if (govCount <= 1) desc = '1 axle on span';
-    else if (govCount === 2) desc = '2 axles on span (tandem)';
-    return { dla, axleCount: govCount, maxSpan, desc };
-}
-
 export default function BeamAnalysisApp() {
     const [spans, setSpans] = useState<Span[]>(DEFAULT_SPANS);
-    const [axles, _setAxles] = useState<Axle[]>(DEFAULT_AXLES);
+    const [axles, setAxles] = useState<Axle[]>(DEFAULT_AXLES);
     const [config, setConfig] = useState<AnalysisConfig>(DEFAULT_CONFIG);
     const [results, setResults] = useState<AnalysisResults | null>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [activeTab, setActiveTab] = useState<'config' | 'results'>('config');
+    const [resultCase, setResultCase] = useState<LoadCase>('truck');
+    const [progress, setProgress] = useState<AnalysisProgress | null>(null);
+    const [analysisError, setAnalysisError] = useState<string | null>(null);
+    const workerRef = useRef<Worker | null>(null);
+    const displayed: CaseResults | null = results ? results.cases[resultCase] ?? results : null;
+
+    useEffect(() => () => workerRef.current?.terminate(), []);
 
     const autoDlaInfo = useMemo(() => computeAutoDlaInfo(spans, axles), [spans, axles]);
     const stepInfo = useMemo(
@@ -1400,6 +794,10 @@ export default function BeamAnalysisApp() {
         const script = document.createElement('script');
         script.src = "https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js";
         script.async = true;
+        script.onerror = () => {
+            console.error('Could not load the Excel export library.');
+            setAnalysisError('Excel export is unavailable. Check your internet connection and reload the app.');
+        };
         document.body.appendChild(script);
         return () => {
             document.body.removeChild(script);
@@ -1420,74 +818,111 @@ export default function BeamAnalysisApp() {
         setSpans(spans.map(s => s.id === id ? { ...s, length: val } : s));
     };
 
-    const runAnalysis = async () => {
+    const runAnalysis = () => {
+        workerRef.current?.terminate();
+        setAnalysisError(null);
         setIsAnalyzing(true);
-        setTimeout(() => {
-            try {
-                const solver = new BeamFEM(spans, axles, config);
-                const res = solver.runAnalysis();
-                setResults(res);
-                setActiveTab('results');
-            } catch (e) {
-                console.error(e);
-                alert(`Analysis failed: ${e instanceof Error ? e.message : 'Check inputs.'}`);
-            }
+        setProgress({ fraction: 0, message: 'Starting analysis...' });
+        const fail = (message: string) => {
+            console.error('Analysis failed:', message);
+            setAnalysisError(message);
             setIsAnalyzing(false);
-        }, 100);
+            setProgress(null);
+            workerRef.current?.terminate();
+            workerRef.current = null;
+        };
+        try {
+            const worker = new AnalysisWorker();
+            workerRef.current = worker;
+            worker.onmessage = (event: MessageEvent<AnalysisResponse>) => {
+                const response = event.data;
+                if (response.type === 'progress') {
+                    setProgress(response.progress);
+                    return;
+                }
+                if (response.type === 'error') {
+                    fail(response.message);
+                    return;
+                }
+                setResults(response.result);
+                setResultCase(response.result.loadCase);
+                setActiveTab('results');
+                setIsAnalyzing(false);
+                setProgress(null);
+                worker.terminate();
+                workerRef.current = null;
+            };
+            worker.onerror = event => {
+                event.preventDefault();
+                fail(event.message || 'Could not run the analysis worker.');
+            };
+            worker.onmessageerror = () => fail('Could not read the analysis worker results.');
+            worker.postMessage({ spans, axles, config });
+        } catch (error) {
+            fail(error instanceof Error ? error.message : 'Could not start the analysis.');
+        }
     };
 
     const downloadExcel = () => {
         if (!results) return;
 
-        // @ts-ignore
         if (typeof window === 'undefined' || !window.XLSX) {
             alert("Excel export library is loading. Please try again in a few seconds.");
             return;
         }
 
-        // @ts-ignore
-        const wb = window.XLSX.utils.book_new();
+        const xlsx = window.XLSX;
+        const wb = xlsx.utils.book_new();
 
         const formatData = (data: EnvelopePoint[]) => data.map(d => ({
-            "Position (m)": parseFloat(d.x.toFixed(3)),
-            "Max": parseFloat(d.max.toFixed(3)),
-            "Min": parseFloat(d.min.toFixed(3))
+            "Position (m)": d.x,
+            "Max": d.max,
+            "Min": d.min
         }));
 
-        // Shear Sheet
-        // @ts-ignore
-        const wsShear = window.XLSX.utils.json_to_sheet(formatData(results.shear));
-        // @ts-ignore
-        window.XLSX.utils.book_append_sheet(wb, wsShear, "Shear Force");
-
-        // Moment Sheet
-        // @ts-ignore
-        const wsMoment = window.XLSX.utils.json_to_sheet(formatData(results.moment));
-        // @ts-ignore
-        window.XLSX.utils.book_append_sheet(wb, wsMoment, "Bending Moment");
-
-        // Deflection Sheet
-        // @ts-ignore
-        const wsDef = window.XLSX.utils.json_to_sheet(formatData(results.deflection));
-        // @ts-ignore
-        window.XLSX.utils.book_append_sheet(wb, wsDef, "Deflection");
-
-        // Reactions Sheet (VBA parity: summary with gov truck position)
-        const reactionData = results.reactions.map((r, i) => ({
-            "Support": `Support ${i + 1}`,
-            "Location (m)": parseFloat(r.x.toFixed(3)),
-            "Max Reaction (kN)": parseFloat(r.max.toFixed(3)),
-            "Min Reaction (kN)": parseFloat(r.min.toFixed(3)),
-            "Gov Truck Pos (m)": r.govPos !== undefined ? parseFloat(r.govPos.toFixed(3)) : 0,
-        }));
-        // @ts-ignore
-        const wsReact = window.XLSX.utils.json_to_sheet(reactionData);
-        // @ts-ignore
-        window.XLSX.utils.book_append_sheet(wb, wsReact, "Reactions");
-
-        // Write file
-        // @ts-ignore
-        window.XLSX.writeFile(wb, "beam_analysis_results.xlsx");
+        const append = (name: string, rows: object[]) =>
+            xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(rows), name);
+        append('Analysis Settings', [{
+            'Load Case': results.loadCase,
+            'Base Increment (m)': results.baseIncrement,
+            'Effective Increment (m)': results.incrementUsed,
+            'Step Control': results.incrementReason,
+            'Elements per Span': results.config.nElemsPerSpan,
+            'Elastic Modulus (Pa)': results.config.E,
+            'Moment of Inertia (m^4)': results.config.I,
+            'Elapsed (ms)': results.elapsedMs,
+        }]);
+        append('Spans', results.spans.map((span, i) => ({ 'Span': i + 1, 'Length (m)': span.length })));
+        append('Axles', results.axles.map((axle, i) => ({
+            'Axle': i + 1, 'Load (kN)': axle.load,
+            'Spacing to Next (m)': i < results.axles.length - 1 ? axle.spacing : 0,
+        })));
+        for (const name of ['truck', 'lane', 'envelope'] as const) {
+            const data = results.cases[name];
+            if (!data) continue;
+            append(`${name} Shear`, formatData(data.shear));
+            append(`${name} Moment`, formatData(data.moment));
+            append(`${name} Deflection`, formatData(data.deflection));
+            append(`${name} Reactions`, data.reactions.map((r, i) => ({
+                'Support': `Support ${i + 1}`, 'Location (m)': r.x,
+                'Max Reaction (kN)': r.max, 'Min Reaction (kN)': r.min,
+                'Gov Truck Pos (m)': r.govPos, 'Applied DLA': data.dlaUsed,
+            })));
+            append(`${name} Reaction Diagrams`, results.truckPositions.map((x, p) => {
+                const row: Record<string, number> = { 'Truck Position (m)': x };
+                data.reactionDiagrams.forEach((diagram, s) => {
+                    row[`Support ${s + 1} Max (kN)`] = diagram[p].max;
+                    row[`Support ${s + 1} Min (kN)`] = diagram[p].min;
+                });
+                return row;
+            }));
+        }
+        try {
+            xlsx.writeFile(wb, 'beam_analysis_results.xlsx');
+        } catch (error) {
+            console.error('Excel export failed:', error);
+            setAnalysisError(`Excel export failed: ${error instanceof Error ? error.message : 'Unexpected export error.'}`);
+        }
     };
 
     return (
@@ -1512,6 +947,17 @@ export default function BeamAnalysisApp() {
             </header>
 
             < main className="max-w-5xl mx-auto p-4 md:p-6" >
+                {analysisError && (
+                    <div role="alert" className="bg-red-50 border border-red-200 text-red-800 p-3 rounded mb-4">
+                        {analysisError}
+                    </div>
+                )}
+                {progress && (
+                    <div role="status" className="bg-blue-50 border border-blue-200 text-blue-800 p-3 rounded mb-4">
+                        {progress.message}
+                        <progress className="w-full mt-2" value={progress.fraction} max={1} />
+                    </div>
+                )}
 
                 {/* Tabs */}
                 < div className="flex gap-4 border-b border-gray-200 mb-6" >
@@ -1620,7 +1066,7 @@ export default function BeamAnalysisApp() {
                                                                 Auto: {(autoDlaInfo.dla * 100).toFixed(0)}% (DLA = {autoDlaInfo.dla.toFixed(2)})
                                                             </span>
                                                             <span className="text-xs text-slate-600">
-                                                                {autoDlaInfo.desc} (L<sub>max</sub> = {autoDlaInfo.maxSpan.toFixed(2)}m)
+                                                                {autoDlaInfo.desc} (governing span = {autoDlaInfo.governingSpan.toFixed(2)}m)
                                                             </span>
                                                         </div>
                                                         <span className="text-[10px] text-slate-400 font-medium">CSA S6 Cl. 3.8.4.5</span>
@@ -1686,7 +1132,7 @@ export default function BeamAnalysisApp() {
                                                         max="200"
                                                         step="1"
                                                         value={config.nElemsPerSpan}
-                                                        onChange={(e) => setConfig({ ...config, nElemsPerSpan: Math.max(2, Math.round(parseFloat(e.target.value) || 40)) })}
+                                                        onChange={(e) => setConfig({ ...config, nElemsPerSpan: Number(e.target.value) })}
                                                         className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
                                                     />
                                                 </div>
@@ -1698,7 +1144,7 @@ export default function BeamAnalysisApp() {
                                                         max="2"
                                                         step="0.05"
                                                         value={config.truckIncrement}
-                                                        onChange={(e) => setConfig({ ...config, truckIncrement: parseFloat(e.target.value) || 0.25 })}
+                                                        onChange={(e) => setConfig({ ...config, truckIncrement: Number(e.target.value) })}
                                                         className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
                                                     />
                                                 </div>
@@ -1706,29 +1152,46 @@ export default function BeamAnalysisApp() {
 
                                             < div className="bg-blue-50 p-3 rounded text-sm text-blue-800 flex gap-2 items-start" >
                                                 <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                                                <p>Mesh: {config.nElemsPerSpan} elements per span. Truck sweep uses <strong>{stepInfo.effective.toFixed(3)}m</strong> steps{stepInfo.wasReduced ? <> (auto-refined from {config.truckIncrement}m — {stepInfo.reason})</> : <> (base {config.truckIncrement}m)</>}. Support alignments are always added exactly.</p>
+                                                <p>Mesh: {config.nElemsPerSpan} elements per span. Truck sweep uses <strong>{stepInfo.effective.toFixed(3)}m</strong> steps{stepInfo.wasAdjusted ? <> (adjusted from {config.truckIncrement}m — {stepInfo.reason})</> : <> (base {config.truckIncrement}m)</>}. Exact support alignments are included in both directions.</p>
                                             </div>
                                         </div>
                                     </div>
 
                                     < div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200" >
                                         <h2 className="text-lg font-semibold mb-2" > Truck Configuration </h2>
-                                        < p className="text-sm text-gray-500 mb-4" > Standard CL - 625 Axle Loads(kN) and Spacings(m) </p>
-                                        < div className="flex flex-wrap gap-2" >
+                                        <p className="text-sm text-gray-500 mb-4">CL-625 defaults; customize up to {MAX_AXLES} axles. Spacing is to the next axle.</p>
+                                        <div className="space-y-2">
                                             {
                                                 axles.map((axle, i) => (
-                                                    <div key={axle.id} className="bg-gray-100 rounded p-2 text-center min-w-[60px]" >
-                                                        <div className="text-xs font-bold text-gray-500" > Axle {i + 1} </div>
-                                                        < div className="font-mono text-sm text-blue-600 font-bold" > {axle.load} </div>
-                                                        {
-                                                            i < axles.length - 1 && (
-                                                                <div className="text-[10px] text-gray-400 mt-1 border-t border-gray-300 pt-1" >
-                                                                    ↓ {axle.spacing} m
-                                                                </div>
-                                                            )
-                                                        }
+                                                    <div key={axle.id} className="flex items-end gap-2 bg-gray-50 rounded p-2">
+                                                        <label className="flex-1 text-xs text-gray-600">
+                                                            Axle {i + 1} load (kN)
+                                                            <input type="number" min="0" value={axle.load}
+                                                                onChange={e => setAxles(axles.map(a => a.id === axle.id ? { ...a, load: Number(e.target.value) } : a))}
+                                                                className="block w-full border border-gray-300 rounded p-1 mt-1" />
+                                                        </label>
+                                                        {i < axles.length - 1 && (
+                                                            <label className="flex-1 text-xs text-gray-600">
+                                                                Spacing to next (m)
+                                                                <input type="number" min="0" step="0.1" value={axle.spacing}
+                                                                    onChange={e => setAxles(axles.map(a => a.id === axle.id ? { ...a, spacing: Number(e.target.value) } : a))}
+                                                                    className="block w-full border border-gray-300 rounded p-1 mt-1" />
+                                                            </label>
+                                                        )}
+                                                        <button aria-label={`Remove axle ${i + 1}`} disabled={axles.length <= 1}
+                                                            onClick={() => setAxles(axles.filter(a => a.id !== axle.id))}
+                                                            className="p-2 text-gray-400 hover:text-red-500 disabled:opacity-30">
+                                                            <Trash2 className="w-4 h-4" />
+                                                        </button>
                                                     </div>
                                                 ))}
+                                        </div>
+                                        <div className="flex gap-3 mt-3">
+                                            <button disabled={axles.length >= MAX_AXLES}
+                                                onClick={() => setAxles([...axles.map((a, i) => i === axles.length - 1 ? { ...a, spacing: 3.6 } : a),
+                                                    { id: `a${Date.now()}`, load: 100, spacing: 0 }])}
+                                                className="text-sm text-blue-600 disabled:opacity-30">Add Axle</button>
+                                            <button onClick={() => setAxles(DEFAULT_AXLES)} className="text-sm text-gray-600">Reset CL-625</button>
                                         </div>
                                     </div>
                                 </div>
@@ -1737,26 +1200,40 @@ export default function BeamAnalysisApp() {
                     )}
 
                 {
-                    activeTab === 'results' && results && (
+                    activeTab === 'results' && results && displayed && (
                         <div className="animate-in fade-in slide-in-from-bottom-4 duration-500" >
+                            <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
+                                <label className="text-sm font-medium">
+                                    Display load case
+                                    <select aria-label="Display load case" value={resultCase}
+                                        onChange={e => setResultCase(e.target.value as LoadCase)}
+                                        className="ml-2 border border-gray-300 rounded p-2">
+                                        {(['truck', 'lane', 'envelope'] as const).filter(name => results.cases[name]).map(name =>
+                                            <option key={name} value={name}>{name === 'truck' ? 'Truck' : name === 'lane' ? 'Lane' : 'Combined Envelope'}</option>)}
+                                    </select>
+                                </label>
+                                <span className="text-xs text-gray-500">
+                                    {results.elapsedMs.toFixed(0)}ms | {results.stats.truckSolves} truck positions | {results.stats.udlSolves} span UDL solves
+                                </span>
+                            </div>
                             {results.incrementUsed !== undefined && (
                                 <div className="w-full bg-blue-50 border border-blue-200 rounded-lg px-4 py-2 mb-4 text-xs text-blue-800">
                                     Sweep step used: <strong>{results.incrementUsed.toFixed(3)}m</strong>
                                     {results.baseIncrement !== undefined && Math.abs(results.incrementUsed - results.baseIncrement) > 1e-9
-                                        ? <> (auto-refined from base {results.baseIncrement.toFixed(3)}m for short spans/axle spacing)</>
+                                        ? <> (adjusted from base {results.baseIncrement.toFixed(3)}m: {results.incrementReason})</>
                                         : <> (base setting)</>}.
-                                    Support peaks captured exactly via alignment positions.
+                                    Exact axle/support alignment positions included. DLA applies only to the truck case.
                                 </div>
                             )}
                             <BeamReactionDiagram
-                                spans={spans}
-                                reactions={results.reactions}
+                                spans={results.spans}
+                                reactions={displayed.reactions}
                                 supportPositions={results.supportPositions}
-                                dla={results.dlaUsed}
+                                dla={displayed.dlaUsed}
                             />
                             <EnvelopeChart
                                 title="Shear Force Envelope"
-                                data={results.shear}
+                                data={displayed.shear}
                                 dataKeyMax="max"
                                 dataKeyMin="min"
                                 unit="Shear (kN)"
@@ -1765,7 +1242,7 @@ export default function BeamAnalysisApp() {
 
                             <EnvelopeChart
                                 title="Bending Moment Envelope"
-                                data={results.moment}
+                                data={displayed.moment}
                                 dataKeyMax="max"
                                 dataKeyMin="min"
                                 unit="Moment (kNm)"
@@ -1775,17 +1252,44 @@ export default function BeamAnalysisApp() {
 
                             <EnvelopeChart
                                 title="Deflection Envelope"
-                                data={results.deflection}
+                                data={displayed.deflection}
                                 dataKeyMax="max"
                                 dataKeyMin="min"
                                 unit="Deflection (m)"
                                 color="#9333ea"
                             />
+                            <div className="bg-white rounded-lg border border-gray-200 p-4 mb-6 overflow-x-auto">
+                                <h3 className="text-lg font-semibold mb-3">Support Reaction Summary</h3>
+                                <table className="w-full text-sm text-right">
+                                    <thead><tr className="border-b">
+                                        <th className="text-left">Support</th><th>Location (m)</th>
+                                        <th>Max (kN)</th><th>Min / uplift (kN)</th><th>Governing truck position (m)</th>
+                                    </tr></thead>
+                                    <tbody>{displayed.reactions.map((r, s) => (
+                                        <tr key={s} className="border-b border-gray-100">
+                                            <td className="text-left py-2">Support {s + 1}</td>
+                                            <td>{r.x.toFixed(2)}</td><td>{r.max.toFixed(2)}</td>
+                                            <td>{r.min.toFixed(2)}</td><td>{r.govPos.toFixed(3)}</td>
+                                        </tr>
+                                    ))}</tbody>
+                                </table>
+                            </div>
+                            <AllSupportsChart diagrams={displayed.reactionDiagrams} />
+                            {displayed.reactionDiagrams.map((diagram, s) => (
+                                <details key={`${resultCase}-${s}`} className="mb-3">
+                                    <summary className="cursor-pointer font-medium text-sm p-3 bg-white rounded border border-gray-200">
+                                        Support {s + 1} (x = {results.supportPositions[s].toFixed(2)}m) reaction diagram
+                                    </summary>
+                                    <EnvelopeChart data={diagram} dataKeyMax="max" dataKeyMin="min"
+                                        title={`Support ${s + 1} Reaction vs Truck Position`} unit="Reaction (kN)"
+                                        color="#2563eb" xAxisTitle="Truck lead position (m)" />
+                                </details>
+                            ))}
 
                             <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200 mt-6" >
                                 <h3 className="font-semibold mb-4" > Export Data </h3>
                                 < div className="text-sm text-gray-600 mb-4" >
-                                    Download the analysis results as an Excel (.xlsx) file with separate sheets for Shear, Moment, Deflection, and Support Reactions.
+                                    Download full-precision Excel results: settings, spans, axles, shear, moment, deflection, support summaries and reaction diagrams. Envelope mode includes Truck, Lane and Combined Envelope sheets.
                                 </div>
                                 < button
                                     onClick={downloadExcel}

@@ -10,6 +10,7 @@
         "build:standalone": "node build-standalone.mjs",
         "start": "node build-standalone.mjs",
         "dev": "npm run dev --workspace=ll-analyzer",
+        "test": "npm run test --workspace=ll-analyzer",
         "lint": "npm run lint --workspace=ll-analyzer"
     }
 }

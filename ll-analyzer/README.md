@@ -1,4 +1,20 @@
-# React + TypeScript + Vite
+# LL Analyzer App
+
+See the [project README](../README.md) for the VBA-based analysis rules, numerical safeguards, accuracy limitations, regression tests, and standalone build workflow.
+
+From the repository root:
+
+```sh
+npm install
+npm run dev
+npm test
+npm run lint
+npm run build
+```
+
+The solver is in [beam-engine.ts](src/beam-engine.ts); [analysis.worker.ts](src/analysis.worker.ts) runs it off the UI thread. Vite embeds the worker in the standalone bundle so analysis also works when opening the generated HTML directly.
+
+## React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
