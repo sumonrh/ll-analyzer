@@ -5,11 +5,11 @@ env:
   - variable: NODE_ENV
     value: production
 
-# Build configuration for Vite React app in subdirectory
-rootDirectory: ll-analyzer
+# Build configuration for the Vite React app at the repository root
+rootDirectory: .
 
 # Build settings
-buildCommand: npm install && npm run build
+buildCommand: npm ci && npm run build
 
 # Output directory (relative to rootDirectory)
 outputDirectory: dist

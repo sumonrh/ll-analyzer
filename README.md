@@ -54,9 +54,23 @@ Regression tests compare the optimized engine against an independent dense LU im
 
 This project uses `npm` and `vite`. Use Node.js 22.18+ (tested with 24.18); the dependency-free numerical tests use Node's built-in TypeScript support. In Windows PowerShell, use `npm.cmd` if script execution policy blocks `npm`.
 
+The app is a single npm project directly in the repository root, with one `package.json` and one `package-lock.json`. There is no nested application or npm workspace. This README is the canonical project documentation. The standalone HTML runs without installed dependencies. If dependency folders have been cleaned, restore them with `npm ci` from the root before development, linting, or rebuilding. Firebase hosting caches are generated and ignored; deployment configuration is retained.
+
+### Project layout
+
+- `index.html`: ready-to-open standalone app; `start.bat` opens it on Windows.
+- `src/`: React UI, analysis engine and inline worker.
+- `tests/`: numerical regression tests, independent VBA-equation reference, and root-layout/build-failure checks.
+- `index.template.html`, `build-standalone.mjs`, `vite.config.ts`, and `tsconfig*.json`: development and build inputs.
+- `dist/index.html`: generated standalone output for deployment; `firebase.json`, `.firebaserc`, and `apphosting.yaml` configure deployment from the root.
+
+Run all npm commands from this folder, not a subfolder.
+
+Editing `LL Analysis VBA Code.txt` does not automatically update the web solver. The current app upgrade was validated against the VBA reference at commit `902f3e8`; newer local VBA edits must be separately ported and validated.
+
 1. Install dependencies:
    ```bash
-   npm install
+   npm ci
    ```
 2. Start the development server:
    ```bash
@@ -66,12 +80,17 @@ This project uses `npm` and `vite`. Use Node.js 22.18+ (tested with 24.18); the 
    ```bash
    npm run build
    ```
-   This type-checks the app and rebuilds the standalone HTML at the repository root and in `ll-analyzer`, plus the deployable `ll-analyzer/dist` output. Open either standalone `index.html` directly in a browser; the analysis worker is embedded and works without a server or internet connection. Excel export retains the existing remotely loaded SheetJS dependency and requires internet access.
+   This type-checks the app and rebuilds the standalone HTML at the repository root and in `dist/index.html`. Open the root `index.html` directly in a browser; the analysis worker is embedded and works without a server or internet connection. Excel export retains the existing remotely loaded SheetJS dependency and requires internet access. Vite reads `index.template.html` for development and builds without replacing the ready-to-open standalone app during development.
 4. Run numerical regression tests and lint:
    ```bash
    npm test
    npm run lint
    ```
+5. Serve the production build locally:
+   ```bash
+   npm start
+   ```
+   This serves `dist` on port 8080. It is separate from `start.bat`, which opens the standalone app without a server.
 
 ## Contributing
 

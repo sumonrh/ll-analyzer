@@ -3,286 +3,552 @@ Option Explicit
 ' ==============================================================================
 ' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 TRUCK)
 ' Fixes: Variable Spans, Error Handling, Stepped Shear, Support Reaction Diagrams
-' App parity: patterned lane UDL, NO lane-load DLA, per-span conservative
-' auto-DLA (truck case), adaptive sweep step, upward-positive reactions
+' Lane UDL: positive/negative influence zones, including partial elements.
+' NO lane-load DLA, placement-dependent truck DLA,
+' adaptive sweep step, upward-positive reactions
 ' ==============================================================================
 
-' Analysis resolution. These defaults are overridden by the Inputs sheet (cells H2 / H3).
-' TRUCK_INCREMENT (H3) is the BASE step; the effective sweep step is auto-refined
-' to match the app (TypeScript computeEffectiveIncrement parity - see ComputeEffectiveIncrement).
-Const DEF_N_ELEMS_PER_SPAN As Long = 40    ' Elements per span
-Const DEF_TRUCK_INCREMENT As Double = 0.25 ' Base moving step (meters)
-Const MAX_AXLES As Long = 20               ' Upper bound when scanning column D for axles
-Const MAX_PATTERN_SPANS As Long = 12       ' 2^n UDL patterns becomes prohibitive beyond this
-Const MIN_SWEEP_STEP As Double = 0.02      ' Floor so tiny spans cannot cause a runaway solve count
-Const MAX_SWEEP_STEPS As Long = 6000       ' Cap on uniform sweep steps per pass (app parity)
+' Analysis resolution. These defaults are overridden by LL Input cells B32 / B33.
+Const DEF_N_ELEMS_PER_SPAN As Long = 40
+Const DEF_TRUCK_INCREMENT As Double = 0.25
+Const MAX_AXLES As Long = 20
+Const MAX_INPUT_SPANS As Long = 10
+Const INPUT_SPAN_FIRST_ROW As Long = 41
+Const INPUT_AXLE_FIRST_ROW As Long = 10
+Const INPUT_CASE_CELL As String = "B7"
+Const INPUT_ELEMENTS_CELL As String = "B32"
+Const INPUT_INCREMENT_CELL As String = "B33"
+Const INPUT_DLA_CELL As String = "B34"
+Const INPUT_DLA_MULTIPLIER_CELL As String = "B35"
+Const INPUT_TRACER_RESPONSE_CELL As String = "B36"
+Const INPUT_TRACER_INDEX_CELL As String = "B37"
+Const MAX_TOTAL_ELEMENTS As Long = 1000
+Const MIN_SWEEP_STEP As Double = 0.02
+Const MAX_SWEEP_STEPS As Long = 6000
+Const INFLUENCE_ROOT_TOL As Double = 0.0000000001
+Const INFLUENCE_VALUE_TOL As Double = 0.000000000001
+Const UDL_VERIFY_TOL As Double = 0.0000001
+Const POINT_LOAD_POSITION_TOL As Double = 0.0001
+Const TRUCK_INFLUENCE_DEPENDENT As Boolean = True
 
 ' Live load factors
-Const DLA_FACTOR As Double = 0.25          ' Dynamic load allowance applied to the truck-only case
-Const LANE_TRUCK_FACTOR As Double = 0.8    ' Truck portion of the lane load (no DLA)
-Const LANE_UDL As Double = 9               ' Lane UDL (kN/m)
+Const DLA_FACTOR As Double = 0.25
+Const LANE_TRUCK_FACTOR As Double = 0.8
+Const LANE_UDL As Double = 9
 
 Private N_ELEMS_PER_SPAN As Long
-Private TRUCK_INCREMENT As Double          ' Base step from Inputs H3
-Private EFF_TRUCK_INCREMENT As Double      ' Effective sweep step actually used (auto-refined)
+Private TRUCK_INCREMENT As Double
+Private EFF_TRUCK_INCREMENT As Double
 
-' Cached LU factorisation of the reduced stiffness matrix. K does not change while the
-' truck moves, so it is factorised once and re-used for every load position.
+' Cached LU factorisation of the reduced stiffness matrix.
 Private m_LU() As Double
 Private m_map() As Long
 Private m_nFree As Long
+Private m_Bandwidth As Long
+
+Private m_InfluenceCoeffs() As Double
+Private m_UDLMax() As Double
+Private m_UDLMin() As Double
+Private m_InfluenceReady As Boolean
+Private m_UDLIntensity As Double
+Private m_UDLEnvelopesReady As Boolean
+Private m_OptimizedSupport() As Double
+Private m_OptimizedSupportReady As Boolean
+Private m_TruckGovLead() As Double
+Private m_TruckGovMask() As Long
+Private m_TruckGovSide() As Long
+Private m_TruckGovReverse() As Boolean
+Private m_TruckGovBase() As Double
+Private m_TruckGovValue() As Double
+Private m_TruckGovReady As Boolean
+
+Private Type TruckGeometry
+    positions() As Double
+    midElement() As Long
+    pointElement() As Long
+    z() As Double
+    delta() As Double
+    pointXi() As Double
+End Type
 
 Sub Setup_And_Run_Analysis()
     Dim wsInput As Worksheet
-    
-    ' 1. Check if Input sheet exists
+
     On Error Resume Next
-    Set wsInput = ThisWorkbook.Sheets("Inputs")
+    Set wsInput = ThisWorkbook.Sheets("LL Input")
     On Error GoTo 0
-    
+
     If wsInput Is Nothing Then
         CreateInputSheet
         MsgBox "Input sheet created." & vbCrLf & vbCrLf & _
-               "1. Set 'Number of Spans' in cell B2." & vbCrLf & _
-               "2. List EVERY span length in column B (starting at B7)." & vbCrLf & _
-               "3. Run this macro again.", vbInformation
+               "1. Enter up to 10 consecutive span lengths in B41:B50." & vbCrLf & _
+               "2. B2 counts the entered spans automatically." & vbCrLf & _
+               "3. Click Analyze to run the analysis.", vbInformation
         Exit Sub
     End If
-    
-    ' 2. Run the Analysis
+
     MainAnalysis
 End Sub
 
 Sub CreateInputSheet()
     Dim ws As Worksheet
     Set ws = ThisWorkbook.Sheets.Add
-    ws.Name = "Inputs"
-    
-    ' --- Section 1: Beam Geometry ---
-    ws.Range("A1").Value = "BEAM CONFIGURATION"
-    ws.Range("A1").Font.Bold = True
-    
-    ws.Range("A2").Value = "Number of Spans:"
-    ws.Range("B2").Value = 3
-    
-    ws.Range("A3").Value = "Modulus of Elasticity (E) [Pa]:"
+    ws.Name = "LL Input"
+
+    BuildInputLayout ws
     ws.Range("B3").Value = 200000000000#
-    
-    ws.Range("A4").Value = "Moment of Inertia (I) [m^4]:"
     ws.Range("B4").Value = 0.005
-    
-    ws.Range("A6").Value = "SPAN LENGTHS (m)"
-    ws.Range("A6").Font.Bold = True
-    ws.Range("A6").Font.Color = vbRed
-    
-    ws.Range("A7").Value = "Span 1"
-    ws.Range("B7").Value = 20
-    ws.Range("A8").Value = "Span 2"
-    ws.Range("B8").Value = 25
-    ws.Range("A9").Value = "Span 3"
-    ws.Range("B9").Value = 20
-    
-    ' --- Section 2: Load Configuration ---
-    ws.Range("D1").Value = "LOAD CONFIGURATION"
-    ws.Range("D1").Font.Bold = True
-    
-    ws.Range("D2").Value = "Case (1=Truck, 2=Lane Load, 3=Envelope):"
-    ws.Range("E2").Value = 1
-    
-    ws.Range("D4").Value = "Axle Loads (kN)"
-    ws.Range("E4").Value = "Spacing to Next (m)"
-    
-    ' Default CL-625 Data. Add or remove rows below D9 to change the axle count.
-    ws.Range("D5").Value = 50:  ws.Range("E5").Value = 3.6
-    ws.Range("D6").Value = 125: ws.Range("E6").Value = 1.2
-    ws.Range("D7").Value = 125: ws.Range("E7").Value = 6.6
-    ws.Range("D8").Value = 175: ws.Range("E8").Value = 6.6
-    ws.Range("D9").Value = 150: ws.Range("E9").Value = 0
-    
-    ' --- Section 3: Analysis Resolution ---
-    ws.Range("G1").Value = "ANALYSIS SETTINGS"
-    ws.Range("G1").Font.Bold = True
-    
-    ws.Range("G2").Value = "Elements per Span:"
-    ws.Range("H2").Value = DEF_N_ELEMS_PER_SPAN
-    ws.Range("G3").Value = "Truck Increment (m):"
-    ws.Range("H3").Value = DEF_TRUCK_INCREMENT
-    ws.Range("G4").Value = "DLA Override (blank = Auto):"
-    ws.Range("H4").Value = ""
-    
-    ' Formatting
-    ws.Columns("A:H").AutoFit
-    ws.Range("A1:E1").Interior.Color = RGB(220, 220, 220)
-    ws.Range("G1:H1").Interior.Color = RGB(220, 220, 220)
+    ws.Range("B41:B43").Value = Application.Transpose(Array(20, 25, 20))
+    ws.Range(INPUT_CASE_CELL).Value = 1
+    ws.Range("B10:B14").Value = Application.Transpose(Array(50, 125, 125, 175, 150))
+    ws.Range("C10:C14").Value = Application.Transpose(Array(3.6, 1.2, 6.6, 6.6, 0))
+    ws.Range(INPUT_ELEMENTS_CELL).Value = DEF_N_ELEMS_PER_SPAN
+    ws.Range(INPUT_INCREMENT_CELL).Value = DEF_TRUCK_INCREMENT
+    UpdateInputGuidance ws
 End Sub
+
+Private Sub BuildInputLayout(ws As Worksheet)
+    ws.Range("A1:H50").UnMerge
+    ws.Range("A1:H50").Clear
+    ws.Range("A1:D50").Font.Size = 10
+    ws.Columns("A").ColumnWidth = 30
+    ws.Columns("B").ColumnWidth = 14
+    ws.Columns("C").ColumnWidth = 14
+    ws.Columns("D").ColumnWidth = 23
+    ws.Range("A1:B1").Merge
+    ws.Range("A1").Value = "LIVE LOAD ANALYSIS - INPUT"
+    ws.Range("A1").Font.Bold = True
+    ws.Range("A1").Font.Size = 12
+    ws.Range("A2").Value = "Number of Spans (automatic):"
+    ws.Range("A3").Value = "Modulus of Elasticity (E):"
+    ws.Range("A4").Value = "Moment of Inertia (I):"
+    ws.Range("A7").Value = "Load Case:"
+    ws.Range("A9:C9").Value = Array("Axle", "Load (kN)", "Next spacing (m)")
+    ws.Range("A32").Value = "Elements per Span:"
+    ws.Range("A33").Value = "Truck Increment (m):"
+    ws.Range("A34").Value = "DLA Override:"
+    ws.Range("A35").Value = "Truck DLA Multiplier (0-1):"
+    ws.Range("A36").Value = "UDL Tracer Response:"
+    ws.Range("A37").Value = "UDL Tracer Index:"
+    ws.Range("A40:B40").Value = Array("Span", "Length (m)")
+    Dim i As Long, heading As Variant
+    For i = 0 To MAX_AXLES - 1
+        ws.Cells(INPUT_AXLE_FIRST_ROW + i, 1).Value = i + 1
+    Next i
+    For i = 0 To MAX_INPUT_SPANS - 1
+        ws.Cells(INPUT_SPAN_FIRST_ROW + i, 1).Value = "Span " & (i + 1)
+    Next i
+    For Each heading In Array(6, 31, 39)
+        ws.Range(ws.Cells(heading, 1), ws.Cells(heading, 4)).Merge
+        ws.Cells(heading, 1).Font.Bold = True
+        ws.Range(ws.Cells(heading, 1), ws.Cells(heading, 4)).Interior.Color = RGB(220, 220, 220)
+    Next heading
+    ws.Range("A6").Value = "LOAD CONFIGURATION"
+    ws.Range("A31").Value = "ANALYSIS SETTINGS"
+    ws.Range("A39").Value = "SPAN LENGTHS (maximum 10)"
+    ws.Range("B3:B4,B7,B10:C29,B32:B37,B41:B50").Interior.Color = RGB(230, 240, 255)
+    ws.Range("A9:C29,A40:B50").Borders.LineStyle = xlContinuous
+    ws.Range("A9:C9,A40:B40").Font.Bold = True
+    ws.Range("A9:C9").WrapText = True
+End Sub
+
+Private Sub EnsureInputLayout(ws As Worksheet)
+    If CStr(ws.Range("A9").Value) <> "Axle" Or _
+       CStr(ws.Range("A40").Value) <> "Span" Then
+        If CStr(ws.Range("G1").Value) <> "ANALYSIS SETTINGS" Then
+            Err.Raise vbObjectError + 18, "EnsureInputLayout", _
+                      "Unrecognized LL Input layout. Use the generated input template."
+        End If
+        Dim lastRow As Long
+        lastRow = ws.Cells(ws.Rows.Count, 2).End(xlUp).Row
+        If lastRow >= 17 Then
+            If Application.WorksheetFunction.CountA(ws.Range("B17:B" & lastRow)) > 0 Then
+                Err.Raise vbObjectError + 18, "EnsureInputLayout", _
+                          "The printable input supports 10 spans. Existing span data beyond Span 10 was not changed."
+            End If
+        End If
+        Dim spans As Variant, axles As Variant, settings As Variant
+        Dim modulus As Variant, inertia As Variant, loadCase As Variant
+        spans = ws.Range("B7:B16").Value
+        axles = ws.Range("D5:E24").Value
+        settings = ws.Range("H2:H7").Value
+        modulus = ws.Range("B3").Value
+        inertia = ws.Range("B4").Value
+        loadCase = ws.Range("E2").Value
+        BuildInputLayout ws
+        ws.Range("B3").Value = modulus
+        ws.Range("B4").Value = inertia
+        ws.Range(INPUT_CASE_CELL).Value = loadCase
+        ws.Range("B41:B50").Value = spans
+        ws.Range("B10:C29").Value = axles
+        ws.Range("B32:B37").Value = settings
+    End If
+    UpdateInputGuidance ws
+End Sub
+
+Private Sub UpdateInputGuidance(ws As Worksheet)
+    ws.Rows("1:50").RowHeight = 13
+    ws.Range("A5,A8,A30").EntireRow.RowHeight = 4
+    ws.Range("A3:A4,A32:A33").EntireRow.RowHeight = 15
+    ws.Rows(1).RowHeight = 20
+    ws.Rows(7).RowHeight = 25
+    ws.Rows(9).RowHeight = 27
+    ws.Rows("34:36").RowHeight = 26
+    ws.Rows("37:38").RowHeight = 21
+    ws.Range("B2").Formula = "=COUNT(B" & INPUT_SPAN_FIRST_ROW & ":B" & _
+                             (INPUT_SPAN_FIRST_ROW + MAX_INPUT_SPANS - 1) & ")"
+    ws.Range("B2").Calculate
+    If IsEmpty(ws.Range(INPUT_DLA_MULTIPLIER_CELL).Value) Then _
+        ws.Range(INPUT_DLA_MULTIPLIER_CELL).Value = 1#
+    ws.Range(INPUT_DLA_MULTIPLIER_CELL).NumberFormat = "0.00########"
+    With ws.Range(INPUT_DLA_MULTIPLIER_CELL).Validation
+        .Delete
+        .Add Type:=xlValidateDecimal, AlertStyle:=xlValidAlertStop, _
+             Operator:=xlBetween, Formula1:="0", Formula2:="1"
+        .IgnoreBlank = True
+        .ErrorTitle = "Invalid DLA multiplier"
+        .ErrorMessage = "Enter a number from 0 to 1. Blank means 1 (no reduction)."
+        .ShowError = True
+    End With
+    If IsEmpty(ws.Range(INPUT_TRACER_RESPONSE_CELL).Value) Then _
+        ws.Range(INPUT_TRACER_RESPONSE_CELL).Value = "Moment"
+    With ws.Range(INPUT_TRACER_RESPONSE_CELL).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+             Formula1:="Moment,Shear,Deflection,Reaction"
+        .ShowError = True
+    End With
+
+    WriteInputNote ws, "C3:D3", "E in Pa."
+    WriteInputNote ws, "C4:D4", "I in m^4."
+    WriteInputNote ws, "C7:D7", "1 = Truck; 2 = Lane load; 3 = Envelope."
+    WriteInputNote ws, "D10:D16", "Up to 20 axles, in consecutive rows. Final axle spacing is ignored."
+    WriteInputNote ws, "C32:D32", "FEM mesh resolution."
+    WriteInputNote ws, "C33:D33", "Moving-truck position step (m)."
+    WriteInputNote ws, "C34:D34", "Blank = Auto by effect. Override: 0.25 = 25%."
+    WriteInputNote ws, "C35:D35", "DLA only: 0 = off; 1 = full; 0.75 = 25% less. Use permitted reductions."
+    WriteInputNote ws, "C36:D36", "UDL-only tracer in LL Results (Cases 2/3)."
+    WriteInputNote ws, "C37:D38", "1-based node/shear-end/support, not metres. Blank = midpoint / Support 1 (not peak)."
+    WriteInputNote ws, "C40:D42", "Up to 10 spans. Enter consecutive lengths; B2 counts this table."
+    Dim savedPrintCommunication As Boolean, errorNumber As Long, errorDescription As String
+    savedPrintCommunication = Application.PrintCommunication
+    On Error GoTo PrintSetupFailed
+    Application.PrintCommunication = False
+    With ws.PageSetup
+        .PaperSize = xlPaperLetter
+        .Orientation = xlPortrait
+        .PrintArea = "$A$1:$D$50"
+        .FitToPagesWide = 1
+        .FitToPagesTall = 1
+        ' Set explicit scaling last: batching fit settings can otherwise disable Zoom.
+        .Zoom = 100
+        .LeftMargin = Application.InchesToPoints(0.35)
+        .RightMargin = Application.InchesToPoints(0.35)
+        .TopMargin = Application.InchesToPoints(0.35)
+        .BottomMargin = Application.InchesToPoints(0.35)
+        .PrintHeadings = False
+        .PrintGridlines = False
+        .CenterHorizontally = True
+    End With
+    Application.PrintCommunication = savedPrintCommunication
+    On Error GoTo 0
+    Dim analyzeButton As Button, candidate As Button
+    For Each candidate In ws.Buttons
+        If candidate.Name = "LLAnalyzeButton" Or candidate.Caption = "Analyze" Then
+            Set analyzeButton = candidate
+            Exit For
+        End If
+    Next candidate
+    If analyzeButton Is Nothing Then
+        Set analyzeButton = ws.Buttons.Add(0, 0, 100, 30)
+    End If
+    With analyzeButton
+        .Name = "LLAnalyzeButton"
+        .Caption = "Analyze"
+        .OnAction = "'" & Replace(ThisWorkbook.Name, "'", "''") & "'!Setup_And_Run_Analysis"
+        .Left = ws.Range("C1").Left + 4
+        .Top = ws.Range("C1").Top + 2
+        .Width = ws.Range("C1:D2").Width - 8
+        .Height = ws.Range("C1:D2").Height - 4
+        .PrintObject = True
+        .Placement = xlMoveAndSize
+    End With
+    Exit Sub
+PrintSetupFailed:
+    errorNumber = Err.Number: errorDescription = Err.Description
+    Application.PrintCommunication = savedPrintCommunication
+    Err.Raise errorNumber, "UpdateInputGuidance", errorDescription
+End Sub
+
+Private Sub WriteInputNote(ws As Worksheet, address As String, _
+                           noteText As String)
+    With ws.Range(address)
+        If .Cells(1, 1).MergeArea.Address <> .Address Then
+            .UnMerge
+            .ClearContents
+            .Merge
+        End If
+        .Value = noteText
+        .WrapText = True
+        .VerticalAlignment = xlTop
+        .Font.Size = 9
+        .Font.Bold = False
+        .Borders.LineStyle = xlContinuous
+        .Interior.Color = xlColorIndexNone
+    End With
+End Sub
+
+Private Function ReadDLASettings(ws As Worksheet, _
+    ByRef isOverridden As Boolean, ByRef baseDLA As Double, _
+    ByRef multiplier As Double) As Double
+    Dim value As Variant
+    value = ws.Range(INPUT_DLA_MULTIPLIER_CELL).Value
+    multiplier = 1#
+    If IsError(value) Then
+        Err.Raise vbObjectError + 16, "ReadDLASettings", _
+                  "Truck DLA Multiplier (B35) must be a number from 0 to 1."
+    End If
+    If Len(Trim$(CStr(value))) > 0 Then
+        If Not IsNumeric(value) Or VarType(value) = vbBoolean Then
+            Err.Raise vbObjectError + 16, "ReadDLASettings", _
+                      "Truck DLA Multiplier (B35) must be a number from 0 to 1."
+        End If
+        multiplier = CDbl(value)
+        If multiplier < 0# Or multiplier > 1# Then
+            Err.Raise vbObjectError + 16, "ReadDLASettings", _
+                      "Truck DLA Multiplier (B35) must be between 0 and 1."
+        End If
+    End If
+
+    isOverridden = False
+    baseDLA = 0#
+    value = ws.Range(INPUT_DLA_CELL).Value
+    If IsError(value) Then
+        Err.Raise vbObjectError + 17, "ReadDLASettings", _
+                  "DLA Override (B34) must be blank or a nonnegative allowance (e.g. 0.25 for 25%)."
+    End If
+    If Len(Trim$(CStr(value))) > 0 Then
+        If Not IsNumeric(value) Or VarType(value) = vbBoolean Then
+            Err.Raise vbObjectError + 17, "ReadDLASettings", _
+                      "DLA Override (B34) must be blank or a nonnegative allowance (e.g. 0.25 for 25%)."
+        End If
+        baseDLA = CDbl(value)
+        If baseDLA < 0# Then
+            Err.Raise vbObjectError + 17, "ReadDLASettings", _
+                      "DLA Override (B34) cannot be negative."
+        End If
+        isOverridden = True
+    End If
+    ReadDLASettings = baseDLA * multiplier
+End Function
+
+Private Function AutomaticDLAForPlacement(leadPos As Double, _
+    spacings() As Double, nAxles As Long, bridgeLength As Double, _
+    Optional isReverse As Boolean = False) As Double
+    If nAxles < 1 Or bridgeLength <= 0# Then
+        Err.Raise vbObjectError + 20, "AutomaticDLAForPlacement", _
+                  "Automatic DLA requires truck axles and a positive bridge length."
+    End If
+
+    Dim i As Long, originalIndex As Long, onBridge As Long, firstThree As Long
+    Dim axlePos As Double
+    axlePos = leadPos
+    For i = 0 To nAxles - 1
+        If axlePos >= -POINT_LOAD_POSITION_TOL And _
+           axlePos <= bridgeLength + POINT_LOAD_POSITION_TOL Then
+            onBridge = onBridge + 1
+            originalIndex = i
+            If isReverse Then originalIndex = nAxles - 1 - i
+            If originalIndex < 3 Then firstThree = firstThree + 1
+        End If
+        If i < nAxles - 1 Then axlePos = axlePos - spacings(i)
+    Next i
+
+    AutomaticDLAForPlacement = TruckGroupDLA(onBridge, firstThree = 3)
+End Function
 
 Sub MainAnalysis()
     Dim wsIn As Worksheet
     Dim i As Long, j As Long
-    
+
     On Error GoTo CleanFail
-    
-    Set wsIn = ThisWorkbook.Sheets("Inputs")
-    
-    ' --- 1. READ INPUTS (fully validated before Excel state is touched) ---
+
+    Set wsIn = ThisWorkbook.Sheets("LL Input")
+    EnsureInputLayout wsIn
+
+    ' --- 1. READ INPUTS ---
+    Dim gapFound As Boolean, spanValue As Variant
+    For i = 0 To MAX_INPUT_SPANS - 1
+        spanValue = wsIn.Cells(INPUT_SPAN_FIRST_ROW + i, 2).Value
+        If IsError(spanValue) Then
+            Err.Raise vbObjectError + 19, "MainAnalysis", _
+                      "Invalid span length in B" & (INPUT_SPAN_FIRST_ROW + i) & "."
+        End If
+        If Len(Trim$(CStr(spanValue))) = 0 Then
+            gapFound = True
+        Else
+            If Not IsNumeric(spanValue) Or VarType(spanValue) = vbBoolean Then
+                Err.Raise vbObjectError + 19, "MainAnalysis", _
+                          "Span lengths in B41:B50 must be positive numbers."
+            End If
+            If VarType(spanValue) = vbString Then
+                Err.Raise vbObjectError + 19, "MainAnalysis", _
+                          "Convert span lengths stored as text to numbers. B2 does not count text values."
+            End If
+            If gapFound Then
+                Err.Raise vbObjectError + 19, "MainAnalysis", _
+                          "Enter span lengths consecutively from B41, without blank rows between spans."
+            End If
+        End If
+    Next i
     Dim numSpans As Long
     If Not IsNumeric(wsIn.Range("B2").Value) Then
         MsgBox "Number of Spans (Cell B2) must be a number.", vbCritical
         Exit Sub
     End If
     numSpans = CLng(wsIn.Range("B2").Value)
-    
+
     If numSpans < 1 Then
         MsgBox "Number of Spans (Cell B2) must be at least 1.", vbCritical
         Exit Sub
     End If
-    
-    ' Read E and I
+
     Dim E_Val As Double, I_Val As Double
-    If Not IsNumeric(wsIn.Range("B3").Value) Or Not IsNumeric(wsIn.Range("B4").Value) Then
+    If Not IsNumeric(wsIn.Range("B3").Value) Or _
+       Not IsNumeric(wsIn.Range("B4").Value) Then
         MsgBox "Modulus of Elasticity (B3) and Moment of Inertia (B4) must be numeric.", vbCritical
         Exit Sub
     End If
+
     E_Val = CDbl(wsIn.Range("B3").Value)
     I_Val = CDbl(wsIn.Range("B4").Value)
+
     If E_Val <= 0 Or I_Val <= 0 Then
         MsgBox "Modulus of Elasticity (B3) and Moment of Inertia (B4) must be greater than zero.", vbCritical
         Exit Sub
     End If
-    
-    ' Read analysis resolution; blank or invalid entries fall back to the defaults
+
     N_ELEMS_PER_SPAN = DEF_N_ELEMS_PER_SPAN
-    If IsNumeric(wsIn.Range("H2").Value) Then
-        If wsIn.Range("H2").Value >= 2 Then N_ELEMS_PER_SPAN = CLng(wsIn.Range("H2").Value)
+    If IsNumeric(wsIn.Range(INPUT_ELEMENTS_CELL).Value) Then
+        If wsIn.Range(INPUT_ELEMENTS_CELL).Value >= 2 Then
+            N_ELEMS_PER_SPAN = CLng(wsIn.Range(INPUT_ELEMENTS_CELL).Value)
+        End If
     End If
-    
+
     TRUCK_INCREMENT = DEF_TRUCK_INCREMENT
-    If IsNumeric(wsIn.Range("H3").Value) Then
-        If wsIn.Range("H3").Value > 0 Then TRUCK_INCREMENT = CDbl(wsIn.Range("H3").Value)
+    If IsNumeric(wsIn.Range(INPUT_INCREMENT_CELL).Value) Then
+        If wsIn.Range(INPUT_INCREMENT_CELL).Value > 0 Then
+            TRUCK_INCREMENT = CDbl(wsIn.Range(INPUT_INCREMENT_CELL).Value)
+        End If
     End If
-    
-    ' Read Spans Dynamically
+
+    If CDbl(numSpans) * N_ELEMS_PER_SPAN > MAX_TOTAL_ELEMENTS Then
+        MsgBox "The dense FEM solver is limited to " & MAX_TOTAL_ELEMENTS & _
+               " total elements. Reduce Elements per Span or Number of Spans.", vbCritical
+        Exit Sub
+    End If
+
     Dim spanLengths() As Double
     ReDim spanLengths(numSpans - 1)
+
     Dim totalLength As Double
     totalLength = 0
-    
+
     For i = 0 To numSpans - 1
         Dim targetCell As Range
-        Set targetCell = wsIn.Range("B" & 7 + i)
-        
+        Set targetCell = wsIn.Cells(INPUT_SPAN_FIRST_ROW + i, 2)
+
         If IsEmpty(targetCell.Value) Or Not IsNumeric(targetCell.Value) Then
             targetCell.Select
             MsgBox "Error: Missing or invalid length for Span " & (i + 1) & "." & vbCrLf & _
-                   "Please enter a value in Cell " & targetCell.Address(False, False) & ".", vbCritical
+                   "Please enter a value in Cell " & _
+                   targetCell.Address(False, False) & ".", vbCritical
             Exit Sub
         End If
-        
+
         If targetCell.Value <= 0 Then
             targetCell.Select
-            MsgBox "Error: Span " & (i + 1) & " length must be greater than zero.", vbCritical
+            MsgBox "Error: Span " & (i + 1) & _
+                   " length must be greater than zero.", vbCritical
             Exit Sub
         End If
-        
+
         spanLengths(i) = CDbl(targetCell.Value)
         totalLength = totalLength + spanLengths(i)
     Next i
-    
+
     Dim loadCase As Long
     loadCase = 1
-    If IsNumeric(wsIn.Range("E2").Value) Then loadCase = CLng(wsIn.Range("E2").Value)
-    
+    If IsNumeric(wsIn.Range(INPUT_CASE_CELL).Value) Then
+        loadCase = CLng(wsIn.Range(INPUT_CASE_CELL).Value)
+    End If
+
     If loadCase < 1 Or loadCase > 3 Then
-        MsgBox "Load Case (Cell E2) must be 1 (Truck), 2 (Lane Load) or 3 (Envelope of both).", vbCritical
+        MsgBox "Load Case (Cell B7) must be 1 (Truck), 2 (Lane Load) or 3 (Envelope of both).", vbCritical
         Exit Sub
     End If
-    
-    If loadCase >= 2 And numSpans > MAX_PATTERN_SPANS Then
-        MsgBox "Lane load patterning evaluates 2^n loaded/unloaded span patterns and is " & _
-               "limited to " & MAX_PATTERN_SPANS & " spans.", vbCritical
-        Exit Sub
-    End If
-    
-    ' Read Axles dynamically: column D from row 5 down to the first blank/non-numeric cell
+
+    ' Read axle loads down to the first blank or non-numeric cell.
     Dim nAxles As Long
     nAxles = 0
+
     For i = 0 To MAX_AXLES - 1
-        If IsEmpty(wsIn.Range("D" & 5 + i).Value) Or Not IsNumeric(wsIn.Range("D" & 5 + i).Value) Then Exit For
+        If IsEmpty(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Or _
+           Not IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Then Exit For
         nAxles = nAxles + 1
     Next i
-    
+
     If nAxles < 1 Then
-        MsgBox "No axle loads found. Enter at least one axle load starting in cell D5.", vbCritical
+        MsgBox "No axle loads found. Enter at least one axle load starting in cell B10.", vbCritical
         Exit Sub
     End If
-    
+
     Dim axles() As Double, spacings() As Double
     ReDim axles(nAxles - 1)
-    ReDim spacings(nAxles - 1)   ' Spacing to the NEXT axle; the trailing entry is always 0
-    
+    ReDim spacings(nAxles - 1)
+
     For i = 0 To nAxles - 1
-        axles(i) = CDbl(wsIn.Range("D" & 5 + i).Value)
+        axles(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value)
+
         If i < nAxles - 1 Then
-            If IsNumeric(wsIn.Range("E" & 5 + i).Value) Then spacings(i) = CDbl(wsIn.Range("E" & 5 + i).Value)
+            If IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value) Then
+                spacings(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value)
+            End If
             If spacings(i) < 0 Then spacings(i) = 0
         End If
     Next i
-    
-    ' Dynamic Load Allowance (DLA):
-    ' If cell H4 contains a user override >= 0, use it.
-    ' Otherwise, dynamically calculate DLA per CSA S6 Cl. 3.8.4.5.
-    ' App parity (TS calculateAutoDla / computeAutoDlaInfo): evaluate EVERY span and
-    ' govern with the highest DLA - using only the longest span under-applies DLA
-    ' to short spans. Axle-count rule: 1 axle = 0.40, 2 axles = 0.30, 3+ = 0.25.
-    Dim DLA_Val As Double
+
+    Dim DLA_Val As Double, DLA_Base As Double, DLA_Multiplier As Double
     Dim isDlaOverridden As Boolean
-    isDlaOverridden = False
-    
-    If IsNumeric(wsIn.Range("H4").Value) And Not IsEmpty(wsIn.Range("H4").Value) Then
-        If wsIn.Range("H4").Value >= 0 Then
-            DLA_Val = CDbl(wsIn.Range("H4").Value)
-            isDlaOverridden = True
-        End If
-    End If
-    
-    If Not isDlaOverridden Then
-        Dim sDla As Long, nOnSpan As Long, dForSpan As Double
-        DLA_Val = 0.25#
-        For sDla = 0 To numSpans - 1
-            nOnSpan = CalculateMaxAxlesOnSpan(spanLengths(sDla), spacings, nAxles)
-            If nOnSpan <= 1 Then
-                dForSpan = 0.4#
-            ElseIf nOnSpan = 2 Then
-                dForSpan = 0.3#
-            Else
-                dForSpan = 0.25#
-            End If
-            If dForSpan > DLA_Val Then DLA_Val = dForSpan
-        Next sDla
-    End If
-    
+    DLA_Val = ReadDLASettings(wsIn, isDlaOverridden, DLA_Base, DLA_Multiplier)
+
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
-    
     ' --- 2. FEM MESH GENERATION ---
     Dim nTotalElems As Long
     nTotalElems = numSpans * N_ELEMS_PER_SPAN
+
     Dim nNodes As Long
     nNodes = nTotalElems + 1
+
     Dim nDOF As Long
     nDOF = nNodes * 2
-    
+
     Dim elemLens() As Double
     ReDim elemLens(nTotalElems - 1)
+
     Dim xNodes() As Double
     ReDim xNodes(nNodes - 1)
-    
+
     Dim currentX As Double, elemCount As Long
-    currentX = 0: elemCount = 0: xNodes(0) = 0
-    
+    currentX = 0
+    elemCount = 0
+    xNodes(0) = 0
+
     For i = 0 To numSpans - 1
         Dim le As Double
         le = spanLengths(i) / N_ELEMS_PER_SPAN
+
         For j = 1 To N_ELEMS_PER_SPAN
             currentX = currentX + le
             xNodes(elemCount + 1) = currentX
@@ -290,308 +556,1141 @@ Sub MainAnalysis()
             elemCount = elemCount + 1
         Next j
     Next i
-    
-    ' --- SHEAR MESH GENERATION (STEPPED) ---
-    ' For Shear, we need 2 points per element (Start, End) to show drops
+
+    ' Stepped shear mesh: two points per element.
     Dim nShearPoints As Long
     nShearPoints = nTotalElems * 2
+
     Dim xShear() As Double
     ReDim xShear(nShearPoints - 1)
-    
-    Dim sIdx As Long: sIdx = 0
-    Dim xCursor As Double: xCursor = 0
+
+    Dim sIdx As Long
+    sIdx = 0
+
+    Dim xCursor As Double
+    xCursor = 0
+
     For i = 0 To nTotalElems - 1
         xShear(sIdx) = xCursor
         xShear(sIdx + 1) = xCursor + elemLens(i)
         xCursor = xCursor + elemLens(i)
         sIdx = sIdx + 2
     Next i
-    
+
     ' --- 3. GLOBAL STIFFNESS MATRIX ---
     Dim K_Global() As Double
     ReDim K_Global(nDOF - 1, nDOF - 1)
     BuildStiffnessMatrix K_Global, nTotalElems, elemLens, E_Val, I_Val
-    
-    ' --- 4. BOUNDARY CONDITIONS (PINS) & SUPPORTS ---
+
+    ' --- 4. BOUNDARY CONDITIONS AND SUPPORTS ---
     Dim constrainedDOFs() As Boolean
     ReDim constrainedDOFs(nDOF - 1)
-    
+
     Dim nSupports As Long
     nSupports = numSpans + 1
-    Dim supportNodes() As Long
+
     Dim supportDOFs() As Long
     Dim supportX() As Double
-    ReDim supportNodes(nSupports - 1)
+
     ReDim supportDOFs(nSupports - 1)
     ReDim supportX(nSupports - 1)
-    
+
     Dim nodeIdx As Long
     nodeIdx = 0
-    constrainedDOFs(0) = True ' Leftmost Y
-    supportNodes(0) = 0
+
+    constrainedDOFs(0) = True
     supportDOFs(0) = 0
     supportX(0) = 0#
-    
+
     For i = 0 To numSpans - 1
         nodeIdx = nodeIdx + N_ELEMS_PER_SPAN
-        constrainedDOFs(nodeIdx * 2) = True ' Right/Intermediate Y
-        supportNodes(i + 1) = nodeIdx
+        constrainedDOFs(nodeIdx * 2) = True
         supportDOFs(i + 1) = nodeIdx * 2
         supportX(i + 1) = xNodes(nodeIdx)
     Next i
-    
-    ' --- 4b. TRUCK MOVEMENT DISCRETISATION (app parity: adaptive sweep step) ---
-    ' A fixed 0.25 m step jumps over entire elements on short spans and misses peaks.
-    ' Effective step = min(base, minSpan/40, minElemLen, minAxleSpacing/8), floored at
-    ' MIN_SWEEP_STEP and capped so uniform steps stay <= MAX_SWEEP_STEPS (TS parity).
+
+    If loadCase >= 2 Then
+        Dim tracerIndex As Long, tracerTitle As String, tracerUnits As String
+        ResolveUDLTracerResponse wsIn, xNodes, xShear, supportX, _
+                                 tracerIndex, tracerTitle, tracerUnits
+    End If
+
+    ' --- 4b. ADAPTIVE TRUCK SWEEP ---
     Dim truckLen As Double
     truckLen = 0#
-    For j = 0 To nAxles - 2: truckLen = truckLen + spacings(j): Next j
-    
-    EFF_TRUCK_INCREMENT = ComputeEffectiveIncrement(TRUCK_INCREMENT, spanLengths, numSpans, _
-                                                    spacings, nAxles, truckLen, totalLength, _
-                                                    N_ELEMS_PER_SPAN)
-    
+
+    For j = 0 To nAxles - 2
+        truckLen = truckLen + spacings(j)
+    Next j
+
+    EFF_TRUCK_INCREMENT = ComputeEffectiveIncrement( _
+        TRUCK_INCREMENT, spanLengths, numSpans, spacings, nAxles, _
+        truckLen, totalLength, N_ELEMS_PER_SPAN)
+
     Dim startPos As Double, endPos As Double
     startPos = -truckLen
     endPos = totalLength + truckLen
-    
+
     Dim nTruckSteps As Long
-    nTruckSteps = CLng(Int((endPos - startPos) / EFF_TRUCK_INCREMENT + 0.000001)) + 1
+    nTruckSteps = CLng(Int( _
+        (endPos - startPos) / EFF_TRUCK_INCREMENT + 0.000001)) + 1
     If nTruckSteps < 2 Then nTruckSteps = 2
-    
+
     Dim xTruckSteps() As Double
     ReDim xTruckSteps(nTruckSteps - 1)
+
     Dim sStep As Long
     For sStep = 0 To nTruckSteps - 1
         xTruckSteps(sStep) = startPos + sStep * EFF_TRUCK_INCREMENT
     Next sStep
-    ' Guarantee the tail position is represented when the sweep is not an exact multiple
+
     If Abs(xTruckSteps(nTruckSteps - 1) - endPos) > 0.000001 Then
         If endPos - xTruckSteps(nTruckSteps - 1) < EFF_TRUCK_INCREMENT Then
             xTruckSteps(nTruckSteps - 1) = endPos
         End If
     End If
-    
+
     ' --- 4c. FACTORISE ONCE ---
-    ' K is identical for every truck position, so the expensive elimination is done once
-    ' and each load position only costs a forward/back substitution.
     Application.StatusBar = "Factorising stiffness matrix (" & nDOF & " DOF)..."
     FactorizeSystem K_Global, constrainedDOFs, nDOF
-    
-    ' --- 5. RUN LIVE LOAD ENVELOPES ---
-    ' Moment/Deflection arrays are sized nNodes; shear arrays are sized nShearPoints (2 per element).
-    ' Reaction arrays are sized (nTruckSteps, nSupports) for continuous diagrams vs truck position.
+
+    ' --- 5. LIVE LOAD ENVELOPES ---
     Dim TrkMaxV() As Double, TrkMinV() As Double
     Dim TrkMaxM() As Double, TrkMinM() As Double
     Dim TrkMaxD() As Double, TrkMinD() As Double
     Dim TrkMaxR() As Double, TrkMinR() As Double
-    Dim TrkSuppMaxR() As Double, TrkSuppMinR() As Double, TrkSuppGovPos() As Double
-    
+    Dim TrkSuppMaxR() As Double, TrkSuppMinR() As Double
+    Dim TrkSuppGovPos() As Double
+
     Dim LneMaxV() As Double, LneMinV() As Double
     Dim LneMaxM() As Double, LneMinM() As Double
     Dim LneMaxD() As Double, LneMinD() As Double
     Dim LneMaxR() As Double, LneMinR() As Double
-    Dim LneSuppMaxR() As Double, LneSuppMinR() As Double, LneSuppGovPos() As Double
-    
+    Dim LneSuppMaxR() As Double, LneSuppMinR() As Double
+    Dim LneSuppGovPos() As Double
+
     Dim EnvMaxV() As Double, EnvMinV() As Double
     Dim EnvMaxM() As Double, EnvMinM() As Double
     Dim EnvMaxD() As Double, EnvMinD() As Double
     Dim EnvMaxR() As Double, EnvMinR() As Double
-    Dim EnvSuppMaxR() As Double, EnvSuppMinR() As Double, EnvSuppGovPos() As Double
-    
+    Dim EnvSuppMaxR() As Double, EnvSuppMinR() As Double
+    Dim EnvSuppGovPos() As Double
+
     If loadCase = 1 Or loadCase = 3 Then
-        RunLoadCaseEnvelope "Truck", 1 + DLA_Val, 0#, axles, spacings, nAxles, _
+        RunLoadCaseEnvelope "Truck", 1 + DLA_Val, 0#, _
+                            axles, spacings, nAxles, _
                             numSpans, spanLengths, totalLength, _
-                            nTotalElems, elemLens, nDOF, nNodes, nShearPoints, E_Val, I_Val, _
-                            K_Global, supportDOFs, nSupports, supportX, xTruckSteps, nTruckSteps, _
-                            TrkMaxV, TrkMinV, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, _
-                            TrkMaxR, TrkMinR
-        ComputeSupportSummary TrkMaxR, TrkMinR, xTruckSteps, nTruckSteps, nSupports, _
-                              TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos
+                            nTotalElems, elemLens, nDOF, nNodes, _
+                            nShearPoints, E_Val, I_Val, _
+                            K_Global, supportDOFs, nSupports, supportX, _
+                            xTruckSteps, nTruckSteps, _
+                            TrkMaxV, TrkMinV, TrkMaxM, TrkMinM, _
+                            TrkMaxD, TrkMinD, TrkMaxR, TrkMinR, _
+                            Not isDlaOverridden, DLA_Multiplier, TRUCK_INFLUENCE_DEPENDENT
+
+        ComputeSupportSummary TrkMaxR, TrkMinR, xTruckSteps, _
+                              nTruckSteps, nSupports, _
+                              TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos, TRUCK_INFLUENCE_DEPENDENT
     End If
-    
+
     If loadCase = 2 Or loadCase = 3 Then
-        ' Lane load carries NO DLA (neither the 0.8 truck portion nor the UDL).
-        ' Truck-only case uses (1 + DLA); lane case uses plain 0.8.
-        Dim laneAxleFactor As Double
-        laneAxleFactor = LANE_TRUCK_FACTOR
-        RunLoadCaseEnvelope "Lane", laneAxleFactor, LANE_UDL, axles, spacings, nAxles, _
+        RunLoadCaseEnvelope "Lane", LANE_TRUCK_FACTOR, LANE_UDL, _
+                            axles, spacings, nAxles, _
                             numSpans, spanLengths, totalLength, _
-                            nTotalElems, elemLens, nDOF, nNodes, nShearPoints, E_Val, I_Val, _
-                            K_Global, supportDOFs, nSupports, supportX, xTruckSteps, nTruckSteps, _
-                            LneMaxV, LneMinV, LneMaxM, LneMinM, LneMaxD, LneMinD, _
-                            LneMaxR, LneMinR
-        ComputeSupportSummary LneMaxR, LneMinR, xTruckSteps, nTruckSteps, nSupports, _
-                              LneSuppMaxR, LneSuppMinR, LneSuppGovPos
+                            nTotalElems, elemLens, nDOF, nNodes, _
+                            nShearPoints, E_Val, I_Val, _
+                            K_Global, supportDOFs, nSupports, supportX, _
+                            xTruckSteps, nTruckSteps, _
+                            LneMaxV, LneMinV, LneMaxM, LneMinM, _
+                            LneMaxD, LneMinD, LneMaxR, LneMinR, _
+                            False, 1#, TRUCK_INFLUENCE_DEPENDENT
+
+        ComputeSupportSummary LneMaxR, LneMinR, xTruckSteps, _
+                              nTruckSteps, nSupports, _
+                              LneSuppMaxR, LneSuppMinR, LneSuppGovPos, TRUCK_INFLUENCE_DEPENDENT
     End If
-    
-    ' --- 6. COMBINED ENVELOPE (CASE 3) ---
+
+    ' --- 6. COMBINED ENVELOPE ---
     If loadCase = 3 Then
-        ReDim EnvMaxV(nShearPoints - 1), EnvMinV(nShearPoints - 1)
-        ReDim EnvMaxM(nNodes - 1), EnvMinM(nNodes - 1)
-        ReDim EnvMaxD(nNodes - 1), EnvMinD(nNodes - 1)
         ReDim EnvMaxR(nTruckSteps - 1, nSupports - 1)
         ReDim EnvMinR(nTruckSteps - 1, nSupports - 1)
-        
-        For i = 0 To nShearPoints - 1
-            EnvMaxV(i) = TrkMaxV(i)
-            If LneMaxV(i) > EnvMaxV(i) Then EnvMaxV(i) = LneMaxV(i)
-            EnvMinV(i) = TrkMinV(i)
-            If LneMinV(i) < EnvMinV(i) Then EnvMinV(i) = LneMinV(i)
-        Next i
-        
-        For i = 0 To nNodes - 1
-            EnvMaxM(i) = TrkMaxM(i)
-            If LneMaxM(i) > EnvMaxM(i) Then EnvMaxM(i) = LneMaxM(i)
-            EnvMinM(i) = TrkMinM(i)
-            If LneMinM(i) < EnvMinM(i) Then EnvMinM(i) = LneMinM(i)
-            
-            EnvMaxD(i) = TrkMaxD(i)
-            If LneMaxD(i) > EnvMaxD(i) Then EnvMaxD(i) = LneMaxD(i)
-            EnvMinD(i) = TrkMinD(i)
-            If LneMinD(i) < EnvMinD(i) Then EnvMinD(i) = LneMinD(i)
-        Next i
-        
+
+        MergeResponseEnvelopes TrkMaxV, TrkMinV, LneMaxV, LneMinV, EnvMaxV, EnvMinV
+        MergeResponseEnvelopes TrkMaxM, TrkMinM, LneMaxM, LneMinM, EnvMaxM, EnvMinM
+        MergeResponseEnvelopes TrkMaxD, TrkMinD, LneMaxD, LneMinD, EnvMaxD, EnvMinD
+
         Dim pStep As Long, sIdx2 As Long
         For pStep = 0 To nTruckSteps - 1
             For sIdx2 = 0 To nSupports - 1
                 EnvMaxR(pStep, sIdx2) = TrkMaxR(pStep, sIdx2)
-                If LneMaxR(pStep, sIdx2) > EnvMaxR(pStep, sIdx2) Then EnvMaxR(pStep, sIdx2) = LneMaxR(pStep, sIdx2)
+                If LneMaxR(pStep, sIdx2) > EnvMaxR(pStep, sIdx2) Then
+                    EnvMaxR(pStep, sIdx2) = LneMaxR(pStep, sIdx2)
+                End If
+
                 EnvMinR(pStep, sIdx2) = TrkMinR(pStep, sIdx2)
-                If LneMinR(pStep, sIdx2) < EnvMinR(pStep, sIdx2) Then EnvMinR(pStep, sIdx2) = LneMinR(pStep, sIdx2)
+                If LneMinR(pStep, sIdx2) < EnvMinR(pStep, sIdx2) Then
+                    EnvMinR(pStep, sIdx2) = LneMinR(pStep, sIdx2)
+                End If
             Next sIdx2
         Next pStep
-        
-        ComputeSupportSummary EnvMaxR, EnvMinR, xTruckSteps, nTruckSteps, nSupports, _
-                              EnvSuppMaxR, EnvSuppMinR, EnvSuppGovPos
+
+        If TRUCK_INFLUENCE_DEPENDENT Then
+            ReDim EnvSuppMaxR(nSupports - 1), EnvSuppMinR(nSupports - 1), EnvSuppGovPos(nSupports - 1)
+            For i = 0 To nSupports - 1
+                EnvSuppMaxR(i) = TrkSuppMaxR(i)
+                EnvSuppGovPos(i) = TrkSuppGovPos(i)
+                If LneSuppMaxR(i) > EnvSuppMaxR(i) Then
+                    EnvSuppMaxR(i) = LneSuppMaxR(i)
+                    EnvSuppGovPos(i) = LneSuppGovPos(i)
+                End If
+                EnvSuppMinR(i) = TrkSuppMinR(i)
+                If LneSuppMinR(i) < EnvSuppMinR(i) Then EnvSuppMinR(i) = LneSuppMinR(i)
+            Next i
+        Else
+            ComputeSupportSummary EnvMaxR, EnvMinR, xTruckSteps, _
+                                  nTruckSteps, nSupports, _
+                                  EnvSuppMaxR, EnvSuppMinR, EnvSuppGovPos
+        End If
     End If
 
     ' --- 7. OUTPUT ---
     OutputResults loadCase, xNodes, xShear, supportX, xTruckSteps, nSupports, _
-                  TrkMaxV, TrkMinV, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, TrkMaxR, TrkMinR, _
+                  TrkMaxV, TrkMinV, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, _
+                  TrkMaxR, TrkMinR, _
                   TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos, _
-                  LneMaxV, LneMinV, LneMaxM, LneMinM, LneMaxD, LneMinD, LneMaxR, LneMinR, _
+                  LneMaxV, LneMinV, LneMaxM, LneMinM, LneMaxD, LneMinD, _
+                  LneMaxR, LneMinR, _
                   LneSuppMaxR, LneSuppMinR, LneSuppGovPos, _
-                  EnvMaxV, EnvMinV, EnvMaxM, EnvMinM, EnvMaxD, EnvMinD, EnvMaxR, EnvMinR, _
+                  EnvMaxV, EnvMinV, EnvMaxM, EnvMinM, EnvMaxD, EnvMinD, _
+                  EnvMaxR, EnvMinR, _
                   EnvSuppMaxR, EnvSuppMinR, EnvSuppGovPos, _
-                  DLA_Val, isDlaOverridden
+                  DLA_Val, isDlaOverridden, DLA_Base, DLA_Multiplier
+
+    If m_TruckGovReady Then
+        WriteTruckDiagnostics xNodes, xShear, axles, spacings, nAxles, elemLens, nTotalElems, _
+            nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports, _
+            Not isDlaOverridden, DLA_Base, DLA_Multiplier, 1# + DLA_Val
+    End If
+    If loadCase >= 2 Then
+        WriteUDLTracer wsIn, xNodes, xShear, supportX, _
+                       nTotalElems, elemLens, nDOF, E_Val, I_Val, _
+                       K_Global, supportDOFs, nSupports
+    End If
+    RemoveLegacyUDLTracer
 
     Application.StatusBar = False
     Application.ScreenUpdating = True
     Application.Calculation = xlCalculationAutomatic
+
     If Abs(EFF_TRUCK_INCREMENT - TRUCK_INCREMENT) > 0.0000001 Then
-        MsgBox "Analysis Complete!" & vbCrLf & "Sweep step used: " & Format(EFF_TRUCK_INCREMENT, "0.000") & _
-               "m (auto-refined from base " & Format(TRUCK_INCREMENT, "0.000") & "m).", vbInformation
+        MsgBox "Analysis Complete!" & vbCrLf & _
+               "Reaction-curve sampling step: " & _
+               Format(EFF_TRUCK_INCREMENT, "0.000") & _
+               "m (auto-refined from base " & _
+               Format(TRUCK_INCREMENT, "0.000") & "m).", vbInformation
     Else
         MsgBox "Analysis Complete!", vbInformation
     End If
     Exit Sub
 
 CleanFail:
-    ' Never leave Excel stuck in manual calculation / no screen updating
     Application.StatusBar = False
     Application.ScreenUpdating = True
     Application.Calculation = xlCalculationAutomatic
-    MsgBox "Analysis failed: " & Err.Description & " (error " & Err.Number & ")", vbCritical
+    MsgBox "Analysis failed: " & Err.Description & _
+           " (error " & Err.Number & ")", vbCritical
 End Sub
 
 ' ==============================================================================
 ' CORE SOLVER SUBROUTINES
 ' ==============================================================================
 
-' Builds the shear / moment / deflection / reaction envelope for one live load configuration.
-' axleFactor scales the base axle loads (1 + DLA for the truck case, plain 0.8 with
-' NO DLA for the lane case) and w_udl > 0 adds the patterned lane UDL (no DLA).
-' The eight output arrays are re-dimensioned here.
-Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, w_udl As Double, _
-                        baseAxles() As Double, spacings() As Double, nAxles As Long, _
-                        numSpans As Long, spanLengths() As Double, totalLength As Double, _
+Private Sub MergeResponseEnvelopes(leftMax() As Double, leftMin() As Double, _
+    rightMax() As Double, rightMin() As Double, ByRef outMax() As Double, ByRef outMin() As Double)
+    Dim i As Long
+    ReDim outMax(LBound(leftMax) To UBound(leftMax)), outMin(LBound(leftMin) To UBound(leftMin))
+    For i = LBound(leftMax) To UBound(leftMax)
+        outMax(i) = leftMax(i)
+        If rightMax(i) > outMax(i) Then outMax(i) = rightMax(i)
+        outMin(i) = leftMin(i)
+        If rightMin(i) < outMin(i) Then outMin(i) = rightMin(i)
+    Next i
+End Sub
+
+Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, _
+                        w_udl As Double, _
+                        baseAxles() As Double, spacings() As Double, _
+                        nAxles As Long, _
+                        numSpans As Long, spanLengths() As Double, _
+                        totalLength As Double, _
                         nElems As Long, elemLens() As Double, nDOF As Long, _
                         nNodes As Long, nShearPoints As Long, _
                         E_Val As Double, I_Val As Double, _
-                        K_Global() As Double, supportDOFs() As Long, nSupports As Long, supportX() As Double, _
+                        K_Global() As Double, supportDOFs() As Long, _
+                        nSupports As Long, supportX() As Double, _
                         xTruckSteps() As Double, nTruckSteps As Long, _
                         ByRef MaxV() As Double, ByRef MinV() As Double, _
                         ByRef MaxM() As Double, ByRef MinM() As Double, _
                         ByRef MaxD() As Double, ByRef MinD() As Double, _
-                        ByRef MaxR() As Double, ByRef MinR() As Double)
+                        ByRef MaxR() As Double, ByRef MinR() As Double, _
+                        Optional autoDLA As Boolean = False, _
+                        Optional dlaMultiplier As Double = 1#, _
+                        Optional influenceDependent As Boolean = False)
+    If autoDLA And (dlaMultiplier < 0# Or dlaMultiplier > 1#) Then
+        Err.Raise vbObjectError + 16, "RunLoadCaseEnvelope", _
+                  "Automatic truck DLA multiplier must be between 0 and 1."
+    End If
+    If influenceDependent And (nAxles < 1 Or nAxles > MAX_AXLES) Then
+        Err.Raise vbObjectError + 25, "RunLoadCaseEnvelope", _
+                  "Influence-dependent loading requires 1 to " & MAX_AXLES & " truck axles."
+    End If
 
     Dim i As Long, j As Long, p As Long, s As Long
-    
+    m_OptimizedSupportReady = False
+    If caseLabel = "Truck" Then m_TruckGovReady = False
+
     Dim axles() As Double
     ReDim axles(nAxles - 1)
-    For j = 0 To nAxles - 1: axles(j) = baseAxles(j) * axleFactor: Next j
-    
-    ' Init with infinity
+
+    For j = 0 To nAxles - 1
+        axles(j) = baseAxles(j) * axleFactor
+    Next j
+
     ReDim MaxV(nShearPoints - 1), MinV(nShearPoints - 1)
     ReDim MaxM(nNodes - 1), MinM(nNodes - 1)
     ReDim MaxD(nNodes - 1), MinD(nNodes - 1)
     ReDim MaxR(nTruckSteps - 1, nSupports - 1)
     ReDim MinR(nTruckSteps - 1, nSupports - 1)
-    
+
     For i = 0 To nNodes - 1
         MaxM(i) = -1E+20: MinM(i) = 1E+20
         MaxD(i) = -1E+20: MinD(i) = 1E+20
     Next i
+
     For i = 0 To nShearPoints - 1
         MaxV(i) = -1E+20: MinV(i) = 1E+20
     Next i
+
     For p = 0 To nTruckSteps - 1
         For s = 0 To nSupports - 1
-            MaxR(p, s) = -1E+20: MinR(p, s) = 1E+20
+            MaxR(p, s) = -1E+20
+            MinR(p, s) = 1E+20
         Next s
     Next p
-    
-    ' --- UDL ANALYSIS (If Required) ---
-    Dim UDL_MaxV() As Double, UDL_MinV() As Double ' Size: nShearPoints
-    Dim UDL_MaxM() As Double, UDL_MinM() As Double ' Size: nNodes
-    Dim UDL_MaxD() As Double, UDL_MinD() As Double ' Size: nNodes
-    Dim UDL_MaxR() As Double, UDL_MinR() As Double ' Size: nSupports
-    
+
+    Dim UDL_MaxV() As Double, UDL_MinV() As Double
+    Dim UDL_MaxM() As Double, UDL_MinM() As Double
+    Dim UDL_MaxD() As Double, UDL_MinD() As Double
+    Dim UDL_MaxR() As Double, UDL_MinR() As Double
+
     ReDim UDL_MaxV(nShearPoints - 1), UDL_MinV(nShearPoints - 1)
     ReDim UDL_MaxM(nNodes - 1), UDL_MinM(nNodes - 1)
     ReDim UDL_MaxD(nNodes - 1), UDL_MinD(nNodes - 1)
     ReDim UDL_MaxR(nSupports - 1), UDL_MinR(nSupports - 1)
-    
+
     If w_udl > 0 Then
-        Application.StatusBar = caseLabel & ": patterning UDL..."
+        Application.StatusBar = caseLabel & ": generating UDL influence zones..."
+
         CalculateUDLEnvelopes numSpans, spanLengths, w_udl, _
                               nElems, elemLens, nDOF, E_Val, I_Val, _
                               K_Global, supportDOFs, nSupports, _
-                              UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, UDL_MaxD, UDL_MinD, _
-                              UDL_MaxR, UDL_MinR
+                              UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, _
+                              UDL_MaxD, UDL_MinD, UDL_MaxR, UDL_MinR
     End If
-    
-    ' --- MOVING TRUCK ANALYSIS ---
-    ' Forward Pass
+
+    If influenceDependent Then
+        BuildInfluenceCache nElems, elemLens, nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports
+        RunInfluenceTruckEnvelope caseLabel, axleFactor, autoDLA, dlaMultiplier, _
+            baseAxles, spacings, nAxles, elemLens, nElems, nSupports, _
+            xTruckSteps, nTruckSteps, MaxV, MinV, MaxM, MinM, MaxD, MinD, MaxR, MinR, _
+            UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, UDL_MaxD, UDL_MinD, UDL_MaxR, UDL_MinR
+        Exit Sub
+    End If
+
+    ' Forward pass
     RunTruckPass caseLabel, axles, spacings, nAxles, _
                  nElems, elemLens, nDOF, spanLengths, E_Val, I_Val, _
-                 K_Global, supportDOFs, nSupports, supportX, xTruckSteps, nTruckSteps, _
+                 K_Global, supportDOFs, nSupports, supportX, _
+                 xTruckSteps, nTruckSteps, _
                  MaxV, MinV, MaxM, MinM, MaxD, MinD, MaxR, MinR, _
-                 UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, UDL_MaxD, UDL_MinD, _
-                 UDL_MaxR, UDL_MinR
-                 
-    ' Reverse Pass
+                 UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, _
+                 UDL_MaxD, UDL_MinD, UDL_MaxR, UDL_MinR, _
+                 autoDLA, dlaMultiplier, False
+
+    ' Reverse pass
     Dim revAxles() As Double, revSpacings() As Double
     ReDim revAxles(nAxles - 1)
     ReDim revSpacings(nAxles - 1)
-    For j = 0 To nAxles - 1: revAxles(j) = axles(nAxles - 1 - j): Next j
-    For j = 0 To nAxles - 2: revSpacings(j) = spacings(nAxles - 2 - j): Next j
-    
+
+    For j = 0 To nAxles - 1
+        revAxles(j) = axles(nAxles - 1 - j)
+    Next j
+
+    For j = 0 To nAxles - 2
+        revSpacings(j) = spacings(nAxles - 2 - j)
+    Next j
+
     RunTruckPass caseLabel, revAxles, revSpacings, nAxles, _
                  nElems, elemLens, nDOF, spanLengths, E_Val, I_Val, _
-                 K_Global, supportDOFs, nSupports, supportX, xTruckSteps, nTruckSteps, _
+                 K_Global, supportDOFs, nSupports, supportX, _
+                 xTruckSteps, nTruckSteps, _
                  MaxV, MinV, MaxM, MinM, MaxD, MinD, MaxR, MinR, _
-                 UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, UDL_MaxD, UDL_MinD, _
-                 UDL_MaxR, UDL_MinR
+                 UDL_MaxV, UDL_MinV, UDL_MaxM, UDL_MinM, _
+                 UDL_MaxD, UDL_MinD, UDL_MaxR, UDL_MinR, _
+                 autoDLA, dlaMultiplier, True
+End Sub
+
+Private Function SelectedGroupDLA(mask As Long, nAxles As Long) As Double
+    Dim i As Long, count As Long, bit As Long
+    bit = 1
+    For i = 0 To nAxles - 1
+        If (mask And bit) <> 0 Then count = count + 1
+        bit = bit * 2
+    Next i
+    SelectedGroupDLA = TruckGroupDLA(count, mask = 7)
+End Function
+
+Private Function TruckGroupDLA(count As Long, frontThree As Boolean) As Double
+    Select Case count
+        Case 0: TruckGroupDLA = 0#
+        Case 1: TruckGroupDLA = 0.4
+        Case 2: TruckGroupDLA = 0.3
+        Case 3
+            If frontThree Then TruckGroupDLA = 0.3 Else TruckGroupDLA = DLA_FACTOR
+        Case Else: TruckGroupDLA = DLA_FACTOR
+    End Select
+End Function
+
+Private Function TruckLoadElement(position As Double, side As Long, nodes() As Double, _
+                                  Optional hint As Long = -1) As Long
+    Dim lo As Long, hi As Long, midpoint As Long, n As Long, tol As Double
+    n = UBound(nodes)
+    tol = INFLUENCE_ROOT_TOL * (1# + nodes(n))
+    TruckLoadElement = -1
+    If position < -tol Or position > nodes(n) + tol Then Exit Function
+    If Abs(position) <= tol And side < 0 Then Exit Function
+    If Abs(position - nodes(n)) <= tol And side > 0 Then Exit Function
+    lo = 0: hi = n
+    If hint >= 0 And hint < n Then
+        If nodes(hint) < position - tol Then
+            lo = hint
+            Do While lo < n
+                If nodes(lo) >= position - tol Then Exit Do
+                lo = lo + 1
+            Loop
+            hi = lo
+        End If
+    End If
+    Do While lo < hi
+        midpoint = (lo + hi) \ 2
+        If nodes(midpoint) < position - tol Then lo = midpoint + 1 Else hi = midpoint
+    Loop
+    If Abs(nodes(lo) - position) <= tol And side > 0 Then
+        TruckLoadElement = lo
+    Else
+        TruckLoadElement = lo - 1
+    End If
+    If TruckLoadElement < 0 Then TruckLoadElement = 0
+    If TruckLoadElement >= n Then TruckLoadElement = n - 1
+End Function
+
+Private Function SelectedTruckResponseAtLead(response As Long, lead As Double, side As Long, _
+    axles() As Double, offsets() As Double, nAxles As Long, nodes() As Double, _
+    forMax As Boolean, autoDLA As Boolean, multiplier As Double, axleFactor As Double, _
+    isReverse As Boolean, ByRef mask As Long, ByRef baseDLA As Double) As Double
+    Dim polynomial() As Double, masks(1) As Long, bases(1) As Double, row As Long, cursor() As Long
+    Dim responseCoeffs() As Double
+    Dim geometry As TruckGeometry
+    ReDim cursor(nAxles - 1), polynomial(3, 1)
+    TruckPolynomialPair response, lead, lead, side, axles, offsets, nAxles, nodes, _
+        autoDLA, multiplier, axleFactor, isReverse, polynomial, masks, bases, cursor, responseCoeffs, geometry
+    row = 1: If forMax Then row = 0
+    mask = masks(row): baseDLA = bases(row)
+    SelectedTruckResponseAtLead = polynomial(0, row)
+End Function
+
+Private Sub TruckPolynomialPair(response As Long, a As Double, b As Double, side As Long, _
+    axles() As Double, offsets() As Double, nAxles As Long, nodes() As Double, _
+    autoDLA As Boolean, multiplier As Double, axleFactor As Double, isReverse As Boolean, _
+    ByRef polynomial() As Double, masks() As Long, bases() As Double, cursor() As Long, _
+    responseCoeffs() As Double, geometry As TruckGeometry, Optional useCursor As Boolean = False, _
+    Optional useCoefficients As Boolean = False, Optional includePoint As Boolean = False, _
+    Optional geometryIndex As Long = -1)
+    Dim i As Long, e As Long, row As Long, bit As Long
+    Dim z As Double, delta As Double, value As Double, threshold As Double, unitValue As Double
+    Dim coeffScale As Double, c0 As Double, c1 As Double, c2 As Double, c3 As Double, factor As Double
+    Dim counts(3) As Long, xi As Double, nElems As Long, lastRow As Long, pointElement As Long
+    Dim position As Double, midpoint As Double, left As Double, tol As Double, length As Double
+    Dim p0 As Double, p1 As Double, p2 As Double, p3 As Double
+    Dim q0 As Double, q1 As Double, q2 As Double, q3 As Double, pointMax As Double, pointMin As Double
+    nElems = UBound(nodes): length = nodes(nElems)
+    tol = INFLUENCE_ROOT_TOL * (1# + length)
+    lastRow = 1
+    If includePoint Then lastRow = 3
+    For row = 0 To lastRow
+        masks(row) = 0
+    Next row
+    bit = 1
+    If isReverse Then bit = CLng(2 ^ (nAxles - 1))
+    For i = 0 To nAxles - 1
+        position = a - offsets(i)
+        If geometryIndex >= 0 Then
+            e = geometry.midElement(i, geometryIndex): cursor(i) = e
+        ElseIf includePoint Then
+            midpoint = (a + b) / 2# - offsets(i)
+            e = -1
+            If midpoint >= -tol And midpoint <= length + tol Then
+                e = cursor(i)
+                If e < 0 Then e = 0
+                left = midpoint - tol
+                Do While e < nElems - 1
+                    If nodes(e + 1) >= left Then Exit Do
+                    e = e + 1
+                Loop
+                Do While e > 0
+                    If nodes(e) < left Then Exit Do
+                    e = e - 1
+                Loop
+            End If
+            cursor(i) = e
+        ElseIf useCursor Then
+            e = TruckLoadElement((a + b) / 2# - offsets(i), side, nodes, cursor(i))
+            cursor(i) = e
+        Else
+            e = TruckLoadElement((a + b) / 2# - offsets(i), side, nodes)
+        End If
+        If e >= 0 And axles(i) <> 0# Then
+            If geometryIndex >= 0 Then
+                z = geometry.z(i, geometryIndex): delta = geometry.delta(i, geometryIndex)
+            Else
+                z = (a - offsets(i) - nodes(e)) / (nodes(e + 1) - nodes(e))
+                delta = (b - a) / (nodes(e + 1) - nodes(e))
+            End If
+            If a = b Then
+                If z < 0# Then z = 0#
+                If z > 1# Then z = 1#
+            End If
+            If useCoefficients Then
+                c0 = responseCoeffs(0, e): c1 = responseCoeffs(1, e)
+                c2 = responseCoeffs(2, e): c3 = responseCoeffs(3, e)
+                coeffScale = responseCoeffs(4, e)
+            Else
+                c0 = m_InfluenceCoeffs(e, response, 0): c1 = m_InfluenceCoeffs(e, response, 1)
+                c2 = m_InfluenceCoeffs(e, response, 2): c3 = m_InfluenceCoeffs(e, response, 3)
+                coeffScale = Abs(c0)
+                If Abs(c1) > coeffScale Then coeffScale = Abs(c1)
+                If Abs(c2) > coeffScale Then coeffScale = Abs(c2)
+                If Abs(c3) > coeffScale Then coeffScale = Abs(c3)
+            End If
+            xi = z + delta / 2#
+            unitValue = ((c3 * xi + c2) * xi + c1) * xi + c0
+            value = axles(i) * unitValue
+            threshold = INFLUENCE_VALUE_TOL * coeffScale * Abs(axles(i))
+            row = -1
+            If value > threshold Then row = 0
+            If value < -threshold Then row = 1
+            If row >= 0 Then
+                If a = b Then
+                    If row = 0 Then p0 = p0 + value Else q0 = q0 + value
+                Else
+                    ' Preserve the former Double function-return rounding before multiplication.
+                    unitValue = ((c3 * z + c2) * z + c1) * z + c0
+                    If row = 0 Then
+                        p0 = p0 + axles(i) * unitValue
+                        p1 = p1 + axles(i) * delta * (c1 + 2# * c2 * z + 3# * c3 * z * z)
+                        p2 = p2 + axles(i) * delta * delta * (c2 + 3# * c3 * z)
+                        p3 = p3 + axles(i) * delta ^ 3 * c3
+                    Else
+                        q0 = q0 + axles(i) * unitValue
+                        q1 = q1 + axles(i) * delta * (c1 + 2# * c2 * z + 3# * c3 * z * z)
+                        q2 = q2 + axles(i) * delta * delta * (c2 + 3# * c3 * z)
+                        q3 = q3 + axles(i) * delta ^ 3 * c3
+                    End If
+                End If
+                masks(row) = masks(row) Or bit
+                counts(row) = counts(row) + 1
+            End If
+        End If
+        If includePoint And axles(i) <> 0# Then
+            If geometryIndex >= 0 Then
+                pointElement = geometry.pointElement(i, geometryIndex)
+            Else
+                pointElement = -1
+                If position >= -tol And position <= length + tol Then
+                    pointElement = e
+                    If pointElement < 0 Then pointElement = nElems - 1
+                    left = position - tol
+                    Do While pointElement > 0
+                        If nodes(pointElement) < left Then Exit Do
+                        pointElement = pointElement - 1
+                    Loop
+                End If
+            End If
+            If pointElement >= 0 Then
+                If pointElement <> e Then
+                    c0 = responseCoeffs(0, pointElement): c1 = responseCoeffs(1, pointElement)
+                    c2 = responseCoeffs(2, pointElement): c3 = responseCoeffs(3, pointElement)
+                    coeffScale = responseCoeffs(4, pointElement)
+                End If
+                If geometryIndex >= 0 Then
+                    xi = geometry.pointXi(i, geometryIndex)
+                Else
+                    xi = (a - offsets(i) - nodes(pointElement)) / (nodes(pointElement + 1) - nodes(pointElement))
+                    If xi < 0# Then xi = 0#
+                    If xi > 1# Then xi = 1#
+                End If
+                unitValue = ((c3 * xi + c2) * xi + c1) * xi + c0
+                value = axles(i) * unitValue
+                threshold = INFLUENCE_VALUE_TOL * coeffScale * Abs(axles(i))
+                row = -1
+                If value > threshold Then row = 2
+                If value < -threshold Then row = 3
+                If row >= 0 Then
+                    If row = 2 Then pointMax = pointMax + value Else pointMin = pointMin + value
+                    masks(row) = masks(row) Or bit
+                    counts(row) = counts(row) + 1
+                End If
+            End If
+        End If
+        If isReverse Then bit = bit \ 2 Else bit = bit * 2
+    Next i
+    For row = 0 To lastRow
+        bases(row) = 0#
+        If autoDLA Then bases(row) = TruckGroupDLA(counts(row), masks(row) = 7)
+        factor = axleFactor * (1# + bases(row) * multiplier)
+        Select Case row
+            Case 0: value = p0
+            Case 1: value = q0
+            Case 2: value = pointMax
+            Case 3: value = pointMin
+        End Select
+        If a = b Or row >= 2 Then
+            polynomial(0, row) = value * axleFactor * (1# + bases(row) * multiplier)
+            polynomial(1, row) = 0#: polynomial(2, row) = 0#: polynomial(3, row) = 0#
+        Else
+            polynomial(0, row) = value * factor
+            If row = 0 Then
+                polynomial(1, row) = p1 * factor: polynomial(2, row) = p2 * factor: polynomial(3, row) = p3 * factor
+            Else
+                polynomial(1, row) = q1 * factor: polynomial(2, row) = q2 * factor: polynomial(3, row) = q3 * factor
+            End If
+        End If
+    Next row
+End Sub
+
+Private Sub SortTruckPositions(values() As Double, first As Long, last As Long)
+    Dim i As Long, j As Long, pivot As Double, value As Double
+    i = first: j = last: pivot = values((first + last) \ 2)
+    Do While i <= j
+        Do While values(i) < pivot: i = i + 1: Loop
+        Do While values(j) > pivot: j = j - 1: Loop
+        If i <= j Then
+            value = values(i): values(i) = values(j): values(j) = value
+            i = i + 1: j = j - 1
+        End If
+    Loop
+    If first < j Then SortTruckPositions values, first, j
+    If i < last Then SortTruckPositions values, i, last
+End Sub
+
+Private Function UniqueTruckPositions(positions() As Double, count As Long, tol As Double) As Long
+    Dim i As Long, unique As Long
+    SortTruckPositions positions, 0, count - 1
+    unique = 1
+    For i = 1 To count - 1
+        If positions(i) - positions(unique - 1) > tol Then
+            positions(unique) = positions(i): unique = unique + 1
+        End If
+    Next i
+    UniqueTruckPositions = unique
+End Function
+
+Private Sub BuildTruckGeometry(nodes() As Double, offsets() As Double, nAxles As Long, _
+                               ByRef geometry As TruckGeometry)
+    Dim i As Long, p As Long, e As Long, n As Long, unique As Long
+    Dim a As Double, b As Double, xi As Double
+    ReDim geometry.positions((UBound(nodes) + 1) * nAxles - 1)
+    For p = 0 To UBound(nodes)
+        For i = 0 To nAxles - 1
+            geometry.positions(n) = nodes(p) + offsets(i): n = n + 1
+        Next i
+    Next p
+    unique = UniqueTruckPositions(geometry.positions, n, INFLUENCE_ROOT_TOL * (1# + nodes(UBound(nodes))))
+    ReDim Preserve geometry.positions(unique - 1)
+    If unique < 2 Then Exit Sub
+    ReDim geometry.midElement(nAxles - 1, unique - 2), geometry.pointElement(nAxles - 1, unique - 2)
+    ReDim geometry.z(nAxles - 1, unique - 2), geometry.delta(nAxles - 1, unique - 2), geometry.pointXi(nAxles - 1, unique - 2)
+    For p = 0 To unique - 2
+        a = geometry.positions(p): b = geometry.positions(p + 1)
+        For i = 0 To nAxles - 1
+            e = TruckLoadElement((a + b) / 2# - offsets(i), 0, nodes)
+            geometry.midElement(i, p) = e
+            If e >= 0 Then
+                geometry.z(i, p) = (a - offsets(i) - nodes(e)) / (nodes(e + 1) - nodes(e))
+                geometry.delta(i, p) = (b - a) / (nodes(e + 1) - nodes(e))
+            End If
+            e = TruckLoadElement(a - offsets(i), 0, nodes)
+            geometry.pointElement(i, p) = e
+            If e >= 0 Then
+                xi = (a - offsets(i) - nodes(e)) / (nodes(e + 1) - nodes(e))
+                If xi < 0# Then xi = 0#
+                If xi > 1# Then xi = 1#
+                geometry.pointXi(i, p) = xi
+            End If
+        Next i
+    Next p
+End Sub
+
+Private Sub TruckStationaryCuts(coeff() As Double, ByRef cuts() As Double, ByRef count As Long, _
+                                Optional reuseCuts As Boolean = False)
+    Dim coeffScale As Double, i As Long, qa As Double, qb As Double, qc As Double, disc As Double, q As Double
+    If Not reuseCuts Then ReDim cuts(3)
+    count = 2: cuts(0) = 0#: cuts(1) = 1#
+    For i = 0 To 3
+        If Abs(coeff(i)) > coeffScale Then coeffScale = Abs(coeff(i))
+    Next i
+    If coeffScale = 0# Then Exit Sub
+    qa = 3# * coeff(3) / coeffScale: qb = 2# * coeff(2) / coeffScale: qc = coeff(1) / coeffScale
+    If Abs(qa) <= INFLUENCE_VALUE_TOL Then
+        If Abs(qb) > INFLUENCE_VALUE_TOL Then InsertInfluenceCut cuts, count, -qc / qb
+    Else
+        disc = qb * qb - 4# * qa * qc
+        If Abs(disc) <= INFLUENCE_VALUE_TOL * (qb * qb + Abs(4# * qa * qc)) Then disc = 0#
+        If disc >= 0# Then
+            If qb >= 0# Then q = -0.5 * (qb + Sqr(disc)) Else q = -0.5 * (qb - Sqr(disc))
+            If q = 0# Then
+                InsertInfluenceCut cuts, count, -qb / (2# * qa)
+            Else
+                InsertInfluenceCut cuts, count, q / qa
+                InsertInfluenceCut cuts, count, qc / q
+            End If
+        End If
+    End If
+End Sub
+
+Private Sub PrepareTruckResponse(response As Long, nodes() As Double, _
+    ByRef knots() As Double, ByRef responseCoeffs() As Double, _
+    Optional ByRef responseIsZero As Boolean = False)
+    Dim e As Long, power As Long, j As Long, n As Long, count As Long
+    Dim coeff(3) As Double, cuts() As Double, coeffScale As Double, position As Double
+    Dim upper As Double, lower As Double, extension As Double, allowance As Double
+    ReDim knots(8 * UBound(nodes) - 1), responseCoeffs(6, UBound(nodes) - 1)
+    responseIsZero = True
+    For e = 0 To UBound(nodes) - 1
+        coeffScale = 0#
+        For power = 0 To 3
+            coeff(power) = m_InfluenceCoeffs(e, response, power)
+            responseCoeffs(power, e) = coeff(power)
+            If Abs(coeff(power)) > coeffScale Then coeffScale = Abs(coeff(power))
+        Next power
+        responseCoeffs(4, e) = coeffScale
+        If coeffScale <> 0# Then responseIsZero = False
+        upper = coeff(0): lower = coeff(0)
+        For power = 1 To 3
+            If coeff(power) > 0# Then upper = upper + coeff(power) Else lower = lower + coeff(power)
+        Next power
+        extension = 4# * INFLUENCE_ROOT_TOL * (1# + nodes(UBound(nodes))) / (nodes(e + 1) - nodes(e))
+        allowance = extension * (Abs(coeff(1)) + (2# + extension) * Abs(coeff(2)) + _
+            (3# + 3# * extension + extension * extension) * Abs(coeff(3))) + _
+            INFLUENCE_VALUE_TOL * (1# + 4# * coeffScale)
+        responseCoeffs(5, e) = upper + allowance
+        responseCoeffs(6, e) = lower - allowance
+        InfluenceCuts coeff, cuts, count
+        For j = 0 To count - 1
+            position = nodes(e) + cuts(j) * (nodes(e + 1) - nodes(e))
+            If n = 0 Then
+                knots(n) = position: n = n + 1
+            ElseIf position <> knots(n - 1) Then
+                knots(n) = position: n = n + 1
+            End If
+        Next j
+    Next e
+    ReDim Preserve knots(n - 1)
+End Sub
+
+Private Function TruckGeometryCanImprove(index As Long, geometry As TruckGeometry, _
+    coeffs() As Double, axles() As Double, nAxles As Long, factor As Double, best() As Double) As Boolean
+    Dim i As Long, e As Long, point As Long, upper As Double, lower As Double
+    Dim maxValue As Double, minValue As Double, margin As Double, weight As Double
+    For i = 0 To nAxles - 1
+        e = geometry.midElement(i, index): point = geometry.pointElement(i, index)
+        upper = 0#: lower = 0#
+        If e >= 0 Then
+            If coeffs(5, e) > upper Then upper = coeffs(5, e)
+            If coeffs(6, e) < lower Then lower = coeffs(6, e)
+        End If
+        If point >= 0 And point <> e Then
+            If coeffs(5, point) > upper Then upper = coeffs(5, point)
+            If coeffs(6, point) < lower Then lower = coeffs(6, point)
+        End If
+        weight = axles(i)
+        If weight >= 0# Then
+            maxValue = maxValue + weight * upper: minValue = minValue + weight * lower
+        Else
+            maxValue = maxValue + weight * lower: minValue = minValue + weight * upper
+        End If
+    Next i
+    maxValue = maxValue * factor: minValue = minValue * factor
+    margin = INFLUENCE_VALUE_TOL * (1# + Abs(maxValue) + Abs(minValue))
+    TruckGeometryCanImprove = maxValue + margin > best(0) Or minValue - margin < best(1)
+End Function
+
+Private Sub TruckResponseExtrema(response As Long, axles() As Double, offsets() As Double, _
+    nAxles As Long, nodes() As Double, knots() As Double, responseCoeffs() As Double, _
+    geometry As TruckGeometry, autoDLA As Boolean, multiplier As Double, _
+    axleFactor As Double, isReverse As Boolean, ByRef best() As Double, _
+    ByRef govLead() As Double, ByRef govMask() As Long, ByRef govBase() As Double, ByRef govSide() As Long)
+    Dim positions() As Double, coeff(3) As Double, n As Long
+    Dim i As Long, j As Long, power As Long, unique As Long, row As Long, side As Long
+    Dim polynomial() As Double, candidates() As Double, nCandidates As Long
+    Dim masks(3) As Long, bases(3) As Double, cursor() As Long, pointOffset As Long
+    Dim a As Double, b As Double, lead As Double, value As Double, tol As Double
+    Dim d0 As Double, d1 As Double, d2 As Double, xi As Double
+    Dim bound As Double, boundScale As Double, margin As Double
+    Dim geometryPosition As Long, geometryIndex As Long, geometryLast As Long
+    Dim boundFactor As Double
+    ReDim positions((UBound(knots) + 1) * nAxles - 1)
+    For j = 0 To UBound(knots)
+        For i = 0 To nAxles - 1
+            positions(n) = knots(j) + offsets(i): n = n + 1
+        Next i
+    Next j
+    tol = INFLUENCE_ROOT_TOL * (1# + nodes(UBound(nodes)))
+    unique = UniqueTruckPositions(positions, n, tol)
+    geometryLast = UBound(geometry.positions)
+    boundFactor = axleFactor
+    If autoDLA Then boundFactor = boundFactor * (1# + 0.4 * multiplier)
+    ReDim cursor(nAxles - 1), polynomial(3, 3), candidates(3)
+    For i = 0 To unique - 1
+        a = positions(i): b = a: pointOffset = 0
+        If i < unique - 1 Then
+            b = positions(i + 1): pointOffset = 2
+        End If
+        Do While geometryPosition < geometryLast
+            If geometry.positions(geometryPosition) >= a Then Exit Do
+            geometryPosition = geometryPosition + 1
+        Loop
+        geometryIndex = -1
+        If pointOffset = 2 And geometryPosition < geometryLast Then
+            If a = geometry.positions(geometryPosition) And b = geometry.positions(geometryPosition + 1) Then geometryIndex = geometryPosition
+        End If
+        If geometryIndex >= 0 And boundFactor >= 0# Then
+            ' Bound both the exact point and interval before evaluating their selected groups.
+            If Not TruckGeometryCanImprove(geometryIndex, geometry, responseCoeffs, axles, nAxles, boundFactor, best) Then GoTo NextTruckPosition
+        End If
+        TruckPolynomialPair response, a, b, 0, axles, offsets, nAxles, nodes, _
+            autoDLA, multiplier, axleFactor, isReverse, polynomial, masks, bases, cursor, responseCoeffs, _
+            geometry, True, True, pointOffset = 2, geometryIndex
+        For row = 0 To 1
+            value = polynomial(0, row + pointOffset)
+            If (row = 0 And value > best(row)) Or (row = 1 And value < best(row)) Then
+                best(row) = value: govLead(row) = a: govMask(row) = masks(row + pointOffset)
+                govBase(row) = bases(row + pointOffset): govSide(row) = 0
+            End If
+        Next row
+        If i < unique - 1 Then
+            For row = 0 To 1
+                If masks(row) = 0 Then GoTo NextTruckRow
+                coeff(0) = polynomial(0, row): bound = coeff(0): boundScale = Abs(coeff(0))
+                For power = 1 To 3
+                    coeff(power) = polynomial(power, row)
+                    boundScale = boundScale + Abs(coeff(power))
+                    If (row = 0 And coeff(power) > 0#) Or (row = 1 And coeff(power) < 0#) Then bound = bound + coeff(power)
+                Next power
+                ' Each normalized power lies in [0,1]; retain a conservative rounding margin.
+                margin = INFLUENCE_VALUE_TOL * (1# + boundScale)
+                If (row = 0 And bound + margin <= best(row)) Or _
+                   (row = 1 And bound - margin >= best(row)) Then GoTo NextTruckRow
+                d0 = coeff(1): d1 = coeff(1) + coeff(2)
+                d2 = coeff(1) + 2# * coeff(2) + 3# * coeff(3)
+                nCandidates = 2: candidates(0) = 0#: candidates(1) = 1#
+                ' Same-sign Bernstein derivative coefficients prove monotonicity.
+                If Not ((d0 >= 0# And d1 >= 0# And d2 >= 0#) Or _
+                        (d0 <= 0# And d1 <= 0# And d2 <= 0#)) Then
+                    TruckStationaryCuts coeff, candidates, nCandidates, True
+                End If
+                For j = 0 To nCandidates - 1
+                    xi = candidates(j)
+                    lead = a + xi * (b - a)
+                    value = ((coeff(3) * xi + coeff(2)) * xi + coeff(1)) * xi + coeff(0)
+                    If (row = 0 And value > best(row)) Or (row = 1 And value < best(row)) Then
+                        side = 0
+                        If candidates(j) = 0# Then side = 1
+                        If candidates(j) = 1# Then side = -1
+                        best(row) = value: govLead(row) = lead: govMask(row) = masks(row)
+                        govBase(row) = bases(row): govSide(row) = side
+                    End If
+                Next j
+NextTruckRow:
+            Next row
+        End If
+NextTruckPosition:
+    Next i
+End Sub
+
+Private Sub RunInfluenceTruckEnvelope(caseLabel As String, axleFactor As Double, autoDLA As Boolean, _
+    multiplier As Double, axles() As Double, spacings() As Double, nAxles As Long, _
+    elemLens() As Double, nElems As Long, nSupports As Long, steps() As Double, nSteps As Long, _
+    MaxV() As Double, MinV() As Double, MaxM() As Double, MinM() As Double, MaxD() As Double, MinD() As Double, _
+    MaxR() As Double, MinR() As Double, UMaxV() As Double, UMinV() As Double, _
+    UMaxM() As Double, UMinM() As Double, UMaxD() As Double, UMinD() As Double, UMaxR() As Double, UMinR() As Double)
+    Dim nodes() As Double, offsets() As Double, weights() As Double, maxima() As Double, minima() As Double
+    Dim r As Long, i As Long, direction As Long, row As Long, p As Long, s As Long, nResponses As Long, rOffset As Long
+    Dim best(1) As Double, govLead(1) As Double, govBase(1) As Double, govMask(1) As Long, govSide(1) As Long
+    Dim oldMax As Double, oldMin As Double, value As Double
+    Dim polynomial() As Double, masks(1) As Long, bases(1) As Double, cursor() As Long
+    Dim knots() As Double, responseCoeffs() As Double
+    Dim forwardWeights() As Double, reverseWeights() As Double, forwardOffsets() As Double, reverseOffsets() As Double
+    Dim forwardGeometry As TruckGeometry, reverseGeometry As TruckGeometry, emptyGeometry As TruckGeometry
+    Dim responseIsZero As Boolean
+    nResponses = UBound(m_InfluenceCoeffs, 2) + 1
+    rOffset = 4 * nElems + 2
+    ReDim nodes(nElems), weights(nAxles - 1), offsets(nAxles - 1), maxima(nResponses - 1), minima(nResponses - 1)
+    ReDim polynomial(3, 1), cursor(nAxles - 1)
+    ReDim m_OptimizedSupport(2, nSupports - 1)
+    If caseLabel = "Truck" Then
+        ReDim m_TruckGovLead(1, nResponses - 1), m_TruckGovMask(1, nResponses - 1)
+        ReDim m_TruckGovSide(1, nResponses - 1), m_TruckGovReverse(1, nResponses - 1)
+        ReDim m_TruckGovBase(1, nResponses - 1), m_TruckGovValue(1, nResponses - 1)
+    End If
+    For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
+    For direction = 0 To 1
+        offsets(0) = 0#
+        For i = 0 To nAxles - 1
+            If direction = 0 Then weights(i) = axles(i) Else weights(i) = axles(nAxles - 1 - i)
+            If i > 0 Then
+                If direction = 0 Then
+                    offsets(i) = offsets(i - 1) + spacings(i - 1)
+                Else
+                    offsets(i) = offsets(i - 1) + spacings(nAxles - 1 - i)
+                End If
+            End If
+        Next i
+        If direction = 0 Then
+            forwardWeights = weights: forwardOffsets = offsets
+            BuildTruckGeometry nodes, offsets, nAxles, forwardGeometry
+        Else
+            reverseWeights = weights: reverseOffsets = offsets
+            BuildTruckGeometry nodes, offsets, nAxles, reverseGeometry
+        End If
+    Next direction
+    For r = 0 To nResponses - 1
+        If r Mod 20 = 0 Then
+            DoEvents
+            Application.StatusBar = caseLabel & ": optimizing truck response " & (r + 1) & " of " & nResponses
+        End If
+        PrepareTruckResponse r, nodes, knots, responseCoeffs, responseIsZero
+        If responseIsZero Then GoTo NextTruckResponse
+        For direction = 0 To 1
+            If direction = 0 Then
+                weights = forwardWeights: offsets = forwardOffsets
+            Else
+                weights = reverseWeights: offsets = reverseOffsets
+            End If
+            best(0) = maxima(r): best(1) = minima(r)
+            oldMax = best(0): oldMin = best(1)
+            If direction = 0 Then
+                TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, forwardGeometry, _
+                    autoDLA, multiplier, axleFactor, False, best, govLead, govMask, govBase, govSide
+            Else
+                TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, reverseGeometry, _
+                    autoDLA, multiplier, axleFactor, True, best, govLead, govMask, govBase, govSide
+            End If
+            maxima(r) = best(0): minima(r) = best(1)
+            If r >= rOffset And best(0) > oldMax Then m_OptimizedSupport(2, r - rOffset) = govLead(0)
+            If caseLabel = "Truck" Then
+                For row = 0 To 1
+                    If (row = 0 And best(row) > oldMax) Or (row = 1 And best(row) < oldMin) Then
+                        m_TruckGovLead(row, r) = govLead(row): m_TruckGovMask(row, r) = govMask(row)
+                        m_TruckGovSide(row, r) = govSide(row): m_TruckGovReverse(row, r) = direction = 1
+                        m_TruckGovBase(row, r) = govBase(row): m_TruckGovValue(row, r) = best(row)
+                    End If
+                Next row
+            End If
+        Next direction
+NextTruckResponse:
+    Next r
+    For direction = 0 To 1
+        If direction = 0 Then
+            weights = forwardWeights: offsets = forwardOffsets
+        Else
+            weights = reverseWeights: offsets = reverseOffsets
+        End If
+        ReDim cursor(nAxles - 1)
+        For p = 0 To nSteps - 1
+            For s = 0 To nSupports - 1
+                r = rOffset + s
+                TruckPolynomialPair r, steps(p), steps(p), 0, weights, offsets, nAxles, nodes, _
+                    autoDLA, multiplier, axleFactor, direction = 1, polynomial, masks, bases, cursor, responseCoeffs, emptyGeometry, True
+                value = polynomial(0, 0) + UMaxR(s)
+                If value > MaxR(p, s) Then MaxR(p, s) = value
+                value = polynomial(0, 1) + UMinR(s)
+                If value < MinR(p, s) Then MinR(p, s) = value
+            Next s
+        Next p
+    Next direction
+    For i = 0 To 2 * nElems - 1
+        MaxV(i) = maxima(i) + UMaxV(i): MinV(i) = minima(i) + UMinV(i)
+    Next i
+    For i = 0 To nElems
+        MaxM(i) = maxima(2 * nElems + i) + UMaxM(i): MinM(i) = minima(2 * nElems + i) + UMinM(i)
+        MaxD(i) = maxima(3 * nElems + 1 + i) + UMaxD(i): MinD(i) = minima(3 * nElems + 1 + i) + UMinD(i)
+    Next i
+    For s = 0 To nSupports - 1
+        m_OptimizedSupport(0, s) = maxima(rOffset + s) + UMaxR(s)
+        m_OptimizedSupport(1, s) = minima(rOffset + s) + UMinR(s)
+    Next s
+    m_OptimizedSupportReady = True
+    If caseLabel = "Truck" Then m_TruckGovReady = True
+End Sub
+
+Private Function ReconstructedTruckResponse(response As Long, forMax As Boolean, _
+    axles() As Double, spacings() As Double, nAxles As Long, elemLens() As Double, nElems As Long, _
+    nDOF As Long, E_Val As Double, I_Val As Double, K_Global() As Double, _
+    supportDOFs() As Long, nSupports As Long, autoDLA As Boolean, multiplier As Double, axleFactor As Double) As Double
+    If Not m_TruckGovReady Then _
+        Err.Raise vbObjectError + 23, "ReconstructedTruckResponse", "Governing truck records are not available."
+    Dim nodes() As Double, F() As Double, loads() As Double, U() As Double
+    Dim V() As Double, M() As Double, D() As Double, reactions() As Double, values() As Double
+    Dim row As Long, i As Long, original As Long, e As Long, reverse As Boolean
+    Dim offset As Double, position As Double, xi As Double, factor As Double
+    row = 1: If forMax Then row = 0
+    reverse = m_TruckGovReverse(row, response)
+    ReDim nodes(nElems), F(nDOF - 1), loads(nElems - 1, 3)
+    For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
+    factor = axleFactor
+    If autoDLA Then factor = factor * (1# + m_TruckGovBase(row, response) * multiplier)
+    For i = 0 To nAxles - 1
+        original = i
+        If reverse Then original = nAxles - 1 - i
+        If (m_TruckGovMask(row, response) And CLng(2 ^ original)) <> 0 Then
+            position = m_TruckGovLead(row, response) - offset
+            e = TruckLoadElement(position, m_TruckGovSide(row, response), nodes)
+            If e < 0 Then Err.Raise vbObjectError + 23, "ReconstructedTruckResponse", "Selected axle is outside its governing interval."
+            xi = (position - nodes(e)) / elemLens(e)
+            If xi < 0# Then xi = 0#
+            If xi > 1# Then xi = 1#
+            AddElementPointLoad F, loads, e, elemLens(e), xi, axles(original) * factor
+        End If
+        If i < nAxles - 1 Then
+            If reverse Then offset = offset + spacings(nAxles - 2 - i) Else offset = offset + spacings(i)
+        End If
+    Next i
+    U = SolveFactored(F, nDOF)
+    CalculateForces U, nElems, elemLens, V, M, D, E_Val, I_Val, loads
+    CalculateSupportReactions K_Global, U, F, supportDOFs, nSupports, nDOF, reactions
+    PackResponses V, M, D, reactions, values
+    ReconstructedTruckResponse = values(response)
+End Function
+
+Private Sub WriteTruckDiagnostics(xNodes() As Double, xShear() As Double, _
+    axles() As Double, spacings() As Double, nAxles As Long, elemLens() As Double, nElems As Long, _
+    nDOF As Long, E_Val As Double, I_Val As Double, K_Global() As Double, _
+    supportDOFs() As Long, nSupports As Long, autoDLA As Boolean, fixedBase As Double, multiplier As Double, axleFactor As Double)
+    Dim ws As Worksheet, last As Range, chart As ChartObject, firstRow As Long
+    Dim responses(3) As Long, labels As Variant, row As Long, g As Long, r As Long, i As Long, original As Long, e As Long
+    Dim maxRow As Long, first As Long, lastIndex As Long, best As Double, demand As Double, rebuilt As Double
+    Dim base As Double, factor As Double, offset As Double, position As Double, xi As Double, value As Double, included As Boolean
+    Dim femChecks(3) As Double
+    Dim coeff(3) As Double, power As Long, nodes() As Double, maskText As String
+    Set ws = ThisWorkbook.Worksheets("LL Results")
+    labels = Array("M Max", "M Min", "V Max", "V Min")
+    For g = 0 To 3
+        maxRow = g Mod 2
+        If g < 2 Then first = 2 * nElems: lastIndex = 3 * nElems Else first = 0: lastIndex = 2 * nElems - 1
+        best = 0#: responses(g) = first
+        For r = first To lastIndex
+            value = m_TruckGovValue(maxRow, r)
+            If (maxRow = 0 And value > best) Or (maxRow = 1 And value < best) Then best = value: responses(g) = r
+        Next r
+        rebuilt = ReconstructedTruckResponse(responses(g), maxRow = 0, axles, spacings, nAxles, _
+            elemLens, nElems, nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports, autoDLA, multiplier, axleFactor)
+        femChecks(g) = rebuilt
+        If Abs(rebuilt - best) > UDL_VERIFY_TOL * (1# + Abs(best)) Then _
+            Err.Raise vbObjectError + 24, "WriteTruckDiagnostics", "Governing truck FEM reconstruction failed for " & labels(g) & "."
+    Next g
+    Set last = ws.Cells.Find("*", LookIn:=xlFormulas, SearchOrder:=xlByRows, SearchDirection:=xlPrevious)
+    firstRow = last.Row + 3
+    For Each chart In ws.ChartObjects
+        If chart.BottomRightCell.Row + 3 > firstRow Then firstRow = chart.BottomRightCell.Row + 3
+    Next chart
+    ws.Cells(firstRow, 1).Value = "TRUCK GOVERNING CASES - INFLUENCE-DEPENDENT LOADING"
+    ws.Cells(firstRow, 1).Font.Bold = True
+    ws.Cells(firstRow + 1, 1).Value = "Continuous truck search; side -1/0/+1 = left limit/exact/right limit. Reaction curves are sampled; support summary extrema are optimized."
+    ws.Range(ws.Cells(firstRow + 1, 1), ws.Cells(firstRow + 1, 11)).Merge
+    ws.Cells(firstRow + 1, 1).WrapText = True
+    ws.Rows(firstRow + 1).RowHeight = 30
+    ws.Cells(firstRow + 3, 1).Resize(1, 11).Value = Array("Case", "Section x (m)", "Lead (m)", "Direction", "Side", "Axle IDs", "Base DLA", "Multiplier", "Effective DLA", "Demand", "FEM check")
+    ws.Cells(firstRow + 3, 1).Resize(1, 11).Font.Bold = True
+    ws.Cells(firstRow + 3, 12).Value = "Checked node / shear face"
+    ws.Cells(firstRow + 3, 12).Font.Bold = True
+    ReDim nodes(nElems)
+    For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
+    For g = 0 To 3
+        r = responses(g): maxRow = g Mod 2: row = firstRow + 4 + g
+        base = fixedBase
+        If autoDLA Then base = m_TruckGovBase(maxRow, r)
+        maskText = ""
+        For i = 0 To nAxles - 1
+            If (m_TruckGovMask(maxRow, r) And CLng(2 ^ i)) <> 0 Then
+                If Len(maskText) > 0 Then maskText = maskText & ","
+                maskText = maskText & (i + 1)
+            End If
+        Next i
+        ws.Cells(row, 1).Value = labels(g)
+        If g < 2 Then ws.Cells(row, 2).Value = xNodes(r - 2 * nElems) Else ws.Cells(row, 2).Value = xShear(r)
+        ws.Cells(row, 3).Value = m_TruckGovLead(maxRow, r)
+        ws.Cells(row, 4).Value = IIf(m_TruckGovReverse(maxRow, r), "Reverse", "Forward")
+        ws.Cells(row, 5).Value = m_TruckGovSide(maxRow, r)
+        ws.Cells(row, 6).NumberFormat = "@": ws.Cells(row, 6).Value = maskText
+        ws.Cells(row, 7).Value = base: ws.Cells(row, 8).Value = multiplier: ws.Cells(row, 9).Value = base * multiplier
+        ws.Cells(row, 10).Value = m_TruckGovValue(maxRow, r)
+        ws.Cells(row, 11).Value = femChecks(g)
+        If g < 2 Then
+            ws.Cells(row, 12).Value = "Node " & (r - 2 * nElems + 1)
+        Else
+            ws.Cells(row, 12).Value = "Element " & (r \ 2 + 1) & IIf(r Mod 2 = 0, " I", " J")
+        End If
+    Next g
+    row = firstRow + 10
+    ws.Cells(row, 1).Resize(1, 7).Value = Array("Case", "Axle ID", "Load (kN)", "Position (m)", "Included", "Static contribution", "Factored contribution")
+    ws.Cells(row, 1).Resize(1, 7).Font.Bold = True
+    For g = 0 To 3
+        r = responses(g): maxRow = g Mod 2: offset = 0#: factor = axleFactor
+        If autoDLA Then factor = factor * (1# + m_TruckGovBase(maxRow, r) * multiplier)
+        For i = 0 To nAxles - 1
+            original = i
+            If m_TruckGovReverse(maxRow, r) Then original = nAxles - 1 - i
+            position = m_TruckGovLead(maxRow, r) - offset
+            e = TruckLoadElement(position, m_TruckGovSide(maxRow, r), nodes)
+            value = 0#
+            If e >= 0 Then
+                xi = (position - nodes(e)) / elemLens(e)
+                If xi < 0# Then xi = 0#
+                If xi > 1# Then xi = 1#
+                For power = 0 To 3: coeff(power) = m_InfluenceCoeffs(e, r, power): Next power
+                value = axles(original) * InfluenceValue(coeff, xi)
+            End If
+            included = (m_TruckGovMask(maxRow, r) And CLng(2 ^ original)) <> 0
+            row = row + 1
+            ws.Cells(row, 1).Resize(1, 7).Value = Array(labels(g), original + 1, axles(original), position, included, value, IIf(included, value * factor, 0#))
+            If i < nAxles - 1 Then
+                If m_TruckGovReverse(maxRow, r) Then offset = offset + spacings(nAxles - 2 - i) Else offset = offset + spacings(i)
+            End If
+        Next i
+    Next g
+    ws.Range(ws.Cells(firstRow + 4, 7), ws.Cells(firstRow + 7, 7)).NumberFormat = "0.00%"
+    ws.Range(ws.Cells(firstRow + 4, 8), ws.Cells(firstRow + 7, 8)).NumberFormat = "0.00"
+    ws.Range(ws.Cells(firstRow + 4, 9), ws.Cells(firstRow + 7, 9)).NumberFormat = "0.00%"
 End Sub
 
 Sub RunTruckPass(caseLabel As String, _
                  axles() As Double, spacings() As Double, nAxles As Long, _
-                 nElems As Long, elemLens() As Double, nDOF As Long, spanLengths() As Double, _
+                 nElems As Long, elemLens() As Double, nDOF As Long, _
+                 spanLengths() As Double, _
                  E_Val As Double, I_Val As Double, _
-                 K_Global() As Double, supportDOFs() As Long, nSupports As Long, supportX() As Double, _
+                 K_Global() As Double, supportDOFs() As Long, _
+                 nSupports As Long, supportX() As Double, _
                  xTruckSteps() As Double, nTruckSteps As Long, _
                  ByRef MaxV() As Double, ByRef MinV() As Double, _
                  ByRef MaxM() As Double, ByRef MinM() As Double, _
@@ -600,7 +1699,10 @@ Sub RunTruckPass(caseLabel As String, _
                  UDL_MaxV() As Double, UDL_MinV() As Double, _
                  UDL_MaxM() As Double, UDL_MinM() As Double, _
                  UDL_MaxD() As Double, UDL_MinD() As Double, _
-                 UDL_MaxR() As Double, UDL_MinR() As Double)
+                 UDL_MaxR() As Double, UDL_MinR() As Double, _
+                 Optional autoDLA As Boolean = False, _
+                 Optional dlaMultiplier As Double = 1#, _
+                 Optional isReverse As Boolean = False)
 
     Dim curLeadPos As Double
     Dim F_Global() As Double
@@ -609,223 +1711,220 @@ Sub RunTruckPass(caseLabel As String, _
     Dim curR() As Double
     Dim i As Long, s As Long
     Dim stepIdx As Long
-    
-    For stepIdx = 0 To nTruckSteps - 1
-        curLeadPos = xTruckSteps(stepIdx)
-        
-        ' Throttled: DoEvents on every step dominates the runtime at fine increments
-        If (stepIdx Mod 25) = 0 Then
-            DoEvents
-            Application.StatusBar = caseLabel & ": processing truck position " & Round(curLeadPos, 2)
-        End If
-        
-        ReDim F_Global(nDOF - 1)
-        Dim elemLoads() As Double
-        ReDim elemLoads(nElems - 1, 3)
-        
-        Dim axPos As Double
-        axPos = curLeadPos
-        ApplyPointLoad F_Global, axPos, axles(0), nElems, elemLens, spanLengths, elemLoads
-        
-        Dim K As Long
-        For K = 0 To nAxles - 2
-            axPos = axPos - spacings(K)
-            ApplyPointLoad F_Global, axPos, axles(K + 1), nElems, elemLens, spanLengths, elemLoads
-        Next K
-        
-        U_Global = SolveFactored(F_Global, nDOF)
-        CalculateForces U_Global, nElems, elemLens, V, M, D, E_Val, I_Val, elemLoads
-        CalculateSupportReactions K_Global, U_Global, F_Global, supportDOFs, nSupports, nDOF, curR
-        
-        ' Envelope Update - MOMENT & DEFLECTION (Nodal)
-        For i = LBound(M) To UBound(M)
-            Dim m_res As Double, d_res As Double
-            
-            m_res = M(i) + UDL_MaxM(i)
-            If m_res > MaxM(i) Then MaxM(i) = m_res
-            m_res = M(i) + UDL_MinM(i)
-            If m_res < MinM(i) Then MinM(i) = m_res
-            
-            d_res = D(i) + UDL_MaxD(i)
-            If d_res > MaxD(i) Then MaxD(i) = d_res
-            d_res = D(i) + UDL_MinD(i)
-            If d_res < MinD(i) Then MinD(i) = d_res
-        Next i
-        
-        ' Envelope Update - SHEAR (Element Edges - Larger Array)
-        For i = LBound(V) To UBound(V)
-            Dim v_res As Double
-            v_res = V(i) + UDL_MaxV(i)
-            If v_res > MaxV(i) Then MaxV(i) = v_res
-            v_res = V(i) + UDL_MinV(i)
-            If v_res < MinV(i) Then MinV(i) = v_res
-        Next i
-        
-        ' Envelope Update - REACTION (Per Support at this truck position)
-        For s = 0 To nSupports - 1
-            Dim r_res_max As Double, r_res_min As Double
-            r_res_max = curR(s) + UDL_MaxR(s)
-            r_res_min = curR(s) + UDL_MinR(s)
-            If r_res_max > MaxR(stepIdx, s) Then MaxR(stepIdx, s) = r_res_max
-            If r_res_min < MinR(stepIdx, s) Then MinR(stepIdx, s) = r_res_min
-        Next s
-    Next stepIdx
-    
-    ' Targeted support alignments for each axle at each support (captures exact peaks on short spans)
+    Dim K As Long, p As Long, nPositions As Long
+    Dim bridgeLength As Double, placementFactor As Double
+    For i = LBound(spanLengths) To UBound(spanLengths)
+        bridgeLength = bridgeLength + spanLengths(i)
+    Next i
+
+    Dim positions() As Double, stepIndices() As Long
+    ReDim positions(nTruckSteps + 2 * nSupports * nAxles - 1)
+    ReDim stepIndices(UBound(positions))
+    For p = 0 To nTruckSteps - 1
+        positions(p) = xTruckSteps(p): stepIndices(p) = p
+    Next p
+    nPositions = nTruckSteps
+
     Dim sTarget As Long, aTarget As Long, signDir As Long
-    Dim alignLeadPos As Double, axDist As Double
-    Dim bestStepIdx As Long
-    
+    Dim alignLeadPos As Double, axDist As Double, bestStepIdx As Long
     For sTarget = 0 To nSupports - 1
         axDist = 0#
         For aTarget = 0 To nAxles - 1
             For signDir = 1 To -1 Step -2
                 alignLeadPos = supportX(sTarget) + signDir * axDist
-                If alignLeadPos >= xTruckSteps(0) - 0.001 And alignLeadPos <= xTruckSteps(nTruckSteps - 1) + 0.001 Then
-                    ReDim F_Global(nDOF - 1)
-                    Dim elemLoadsTgt() As Double
-                    ReDim elemLoadsTgt(nElems - 1, 3)
-                    
-                    Dim axPosTgt As Double
-                    axPosTgt = alignLeadPos
-                    ApplyPointLoad F_Global, axPosTgt, axles(0), nElems, elemLens, spanLengths, elemLoadsTgt
-                    
-                    For K = 0 To nAxles - 2
-                        axPosTgt = axPosTgt - spacings(K)
-                        ApplyPointLoad F_Global, axPosTgt, axles(K + 1), nElems, elemLens, spanLengths, elemLoadsTgt
-                    Next K
-                    
-                    U_Global = SolveFactored(F_Global, nDOF)
-                    CalculateForces U_Global, nElems, elemLens, V, M, D, E_Val, I_Val, elemLoadsTgt
-                    CalculateSupportReactions K_Global, U_Global, F_Global, supportDOFs, nSupports, nDOF, curR
-                    
-                    ' Envelope Update - MOMENT & DEFLECTION
-                    For i = LBound(M) To UBound(M)
-                        Dim m_tgt As Double, d_tgt As Double
-                        m_tgt = M(i) + UDL_MaxM(i)
-                        If m_tgt > MaxM(i) Then MaxM(i) = m_tgt
-                        m_tgt = M(i) + UDL_MinM(i)
-                        If m_tgt < MinM(i) Then MinM(i) = m_tgt
-                        
-                        d_tgt = D(i) + UDL_MaxD(i)
-                        If d_tgt > MaxD(i) Then MaxD(i) = d_tgt
-                        d_tgt = D(i) + UDL_MinD(i)
-                        If d_tgt < MinD(i) Then MinD(i) = d_tgt
-                    Next i
-                    
-                    ' Envelope Update - SHEAR
-                    For i = LBound(V) To UBound(V)
-                        Dim v_tgt As Double
-                        v_tgt = V(i) + UDL_MaxV(i)
-                        If v_tgt > MaxV(i) Then MaxV(i) = v_tgt
-                        v_tgt = V(i) + UDL_MinV(i)
-                        If v_tgt < MinV(i) Then MinV(i) = v_tgt
-                    Next i
-                    
-                    ' Associate with closest step index in reaction diagram (effective-step parity)
+                If alignLeadPos >= xTruckSteps(0) - 0.001 And _
+                   alignLeadPos <= xTruckSteps(nTruckSteps - 1) + 0.001 Then
                     bestStepIdx = CLng(Round((alignLeadPos - xTruckSteps(0)) / EFF_TRUCK_INCREMENT))
                     If bestStepIdx < 0 Then bestStepIdx = 0
                     If bestStepIdx > nTruckSteps - 1 Then bestStepIdx = nTruckSteps - 1
-                    For s = 0 To nSupports - 1
-                        Dim r_max_tgt As Double, r_min_tgt As Double
-                        r_max_tgt = curR(s) + UDL_MaxR(s)
-                        r_min_tgt = curR(s) + UDL_MinR(s)
-                        If r_max_tgt > MaxR(bestStepIdx, s) Then MaxR(bestStepIdx, s) = r_max_tgt
-                        If r_min_tgt < MinR(bestStepIdx, s) Then MinR(bestStepIdx, s) = r_min_tgt
-                    Next s
+                    positions(nPositions) = alignLeadPos
+                    stepIndices(nPositions) = bestStepIdx
+                    nPositions = nPositions + 1
                 End If
             Next signDir
             If aTarget < nAxles - 1 Then axDist = axDist + spacings(aTarget)
         Next aTarget
     Next sTarget
+
+    For p = 0 To nPositions - 1
+        curLeadPos = positions(p): stepIdx = stepIndices(p)
+        placementFactor = 1#
+        If autoDLA Then placementFactor = 1# + _
+            AutomaticDLAForPlacement(curLeadPos, spacings, nAxles, bridgeLength, isReverse) * dlaMultiplier
+
+        If (p Mod 25) = 0 Then
+            DoEvents
+            Application.StatusBar = caseLabel & _
+                ": processing truck position " & Round(curLeadPos, 2)
+        End If
+
+        ReDim F_Global(nDOF - 1)
+
+        Dim elemLoads() As Double
+        ReDim elemLoads(nElems - 1, 3)
+
+        Dim axPos As Double
+        axPos = curLeadPos
+
+        ApplyPointLoad F_Global, axPos, axles(0) * placementFactor, _
+                       nElems, elemLens, spanLengths, elemLoads
+
+        For K = 0 To nAxles - 2
+            axPos = axPos - spacings(K)
+            ApplyPointLoad F_Global, axPos, axles(K + 1) * placementFactor, _
+                           nElems, elemLens, spanLengths, elemLoads
+        Next K
+
+        U_Global = SolveFactored(F_Global, nDOF)
+
+        CalculateForces U_Global, nElems, elemLens, _
+                        V, M, D, E_Val, I_Val, elemLoads
+
+        CalculateSupportReactions K_Global, U_Global, F_Global, _
+                                  supportDOFs, nSupports, nDOF, curR
+
+        ' Moment and deflection envelopes
+        For i = LBound(M) To UBound(M)
+            Dim m_res As Double, d_res As Double
+
+            m_res = M(i) + UDL_MaxM(i)
+            If m_res > MaxM(i) Then MaxM(i) = m_res
+
+            m_res = M(i) + UDL_MinM(i)
+            If m_res < MinM(i) Then MinM(i) = m_res
+
+            d_res = D(i) + UDL_MaxD(i)
+            If d_res > MaxD(i) Then MaxD(i) = d_res
+
+            d_res = D(i) + UDL_MinD(i)
+            If d_res < MinD(i) Then MinD(i) = d_res
+        Next i
+
+        ' Shear envelope
+        For i = LBound(V) To UBound(V)
+            Dim v_res As Double
+
+            v_res = V(i) + UDL_MaxV(i)
+            If v_res > MaxV(i) Then MaxV(i) = v_res
+
+            v_res = V(i) + UDL_MinV(i)
+            If v_res < MinV(i) Then MinV(i) = v_res
+        Next i
+
+        ' Reactions at this truck position
+        For s = 0 To nSupports - 1
+            Dim r_res_max As Double, r_res_min As Double
+
+            r_res_max = curR(s) + UDL_MaxR(s)
+            r_res_min = curR(s) + UDL_MinR(s)
+
+            If r_res_max > MaxR(stepIdx, s) Then
+                MaxR(stepIdx, s) = r_res_max
+            End If
+            If r_res_min < MinR(stepIdx, s) Then
+                MinR(stepIdx, s) = r_res_min
+            End If
+        Next s
+    Next p
 End Sub
 
-Sub BuildStiffnessMatrix(ByRef K() As Double, nElems As Long, elemLens() As Double, E_Modulus As Double, I_Inertia As Double)
+Sub BuildStiffnessMatrix(ByRef K() As Double, nElems As Long, _
+                         elemLens() As Double, E_Modulus As Double, _
+                         I_Inertia As Double)
+
     Dim i As Long, R As Long, c As Long
     Dim le As Double, Coeff As Double
     Dim k_loc(3, 3) As Double
     Dim map(3) As Long
-    
+
     For i = 0 To nElems - 1
         le = elemLens(i)
         Coeff = (E_Modulus * I_Inertia) / (le ^ 3)
-        
-        k_loc(0, 0) = 12:     k_loc(0, 1) = 6 * le:      k_loc(0, 2) = -12:      k_loc(0, 3) = 6 * le
-        k_loc(1, 0) = 6 * le: k_loc(1, 1) = 4 * le * le: k_loc(1, 2) = -6 * le: k_loc(1, 3) = 2 * le * le
-        k_loc(2, 0) = -12:    k_loc(2, 1) = -6 * le:     k_loc(2, 2) = 12:      k_loc(2, 3) = -6 * le
-        k_loc(3, 0) = 6 * le: k_loc(3, 1) = 2 * le * le: k_loc(3, 2) = -6 * le: k_loc(3, 3) = 4 * le * le
-        
-        map(0) = i * 2: map(1) = i * 2 + 1
-        map(2) = (i + 1) * 2: map(3) = (i + 1) * 2 + 1
-        
+
+        ElementStiffness le, k_loc
+
+        map(0) = i * 2
+        map(1) = i * 2 + 1
+        map(2) = (i + 1) * 2
+        map(3) = (i + 1) * 2 + 1
+
         For R = 0 To 3
             For c = 0 To 3
-                K(map(R), map(c)) = K(map(R), map(c)) + (k_loc(R, c) * Coeff)
+                K(map(R), map(c)) = K(map(R), map(c)) + _
+                                   k_loc(R, c) * Coeff
             Next c
         Next R
     Next i
 End Sub
 
-' V_Out is size 2*nElems (Stepped), while M_Out/D_Out are nNodes (Continuous).
-' M_Out is returned already flipped to the sagging-positive convention used by the charts,
-' so that the max/min envelopes are built on the plotted sign.
-' elemLoads subtracts the element consistent load vector so that internal shear, stepped drops,
-' and end reactions match exact equilibrium (k_loc * u_loc - f_elem_load).
-Sub CalculateForces(U() As Double, nElems As Long, elemLens() As Double, _
-                   ByRef V_Out() As Double, ByRef M_Out() As Double, ByRef D_Out() As Double, _
-                   E_Modulus As Double, I_Inertia As Double, _
-                   elemLoads() As Double)
-    
+Private Sub ElementStiffness(le As Double, k_loc() As Double)
+    k_loc(0, 0) = 12: k_loc(0, 1) = 6 * le
+    k_loc(0, 2) = -12: k_loc(0, 3) = 6 * le
+    k_loc(1, 0) = 6 * le: k_loc(1, 1) = 4 * le * le
+    k_loc(1, 2) = -6 * le: k_loc(1, 3) = 2 * le * le
+    k_loc(2, 0) = -12: k_loc(2, 1) = -6 * le
+    k_loc(2, 2) = 12: k_loc(2, 3) = -6 * le
+    k_loc(3, 0) = 6 * le: k_loc(3, 1) = 2 * le * le
+    k_loc(3, 2) = -6 * le: k_loc(3, 3) = 4 * le * le
+End Sub
+
+Sub CalculateForces(U() As Double, nElems As Long, _
+                    elemLens() As Double, _
+                    ByRef V_Out() As Double, _
+                    ByRef M_Out() As Double, _
+                    ByRef D_Out() As Double, _
+                    E_Modulus As Double, I_Inertia As Double, _
+                    elemLoads() As Double)
+
     Dim nNodes As Long
     nNodes = nElems + 1
-    
-    ' Output sizing
-    ReDim V_Out(nElems * 2 - 1) ' Start/End of each element
-    ReDim M_Out(nNodes - 1)     ' Nodal average
-    ReDim D_Out(nNodes - 1)     ' Nodal value
-    
-    ' Element Forces
+
+    ReDim V_Out(nElems * 2 - 1)
+    ReDim M_Out(nNodes - 1)
+    ReDim D_Out(nNodes - 1)
+
     Dim ElemForces() As Double
     ReDim ElemForces(nElems - 1, 3)
-    
+
     Dim e As Long
     For e = 0 To nElems - 1
-        Dim le As Double: le = elemLens(e)
-        Dim Coeff As Double: Coeff = (E_Modulus * I_Inertia) / (le ^ 3)
+        Dim le As Double
+        le = elemLens(e)
+
+        Dim Coeff As Double
+        Coeff = (E_Modulus * I_Inertia) / (le ^ 3)
+
         Dim u_loc(3) As Double
-        u_loc(0) = U(e * 2): u_loc(1) = U(e * 2 + 1)
-        u_loc(2) = U((e + 1) * 2): u_loc(3) = U((e + 1) * 2 + 1)
-        
+        u_loc(0) = U(e * 2)
+        u_loc(1) = U(e * 2 + 1)
+        u_loc(2) = U((e + 1) * 2)
+        u_loc(3) = U((e + 1) * 2 + 1)
+
         Dim k_loc(3, 3) As Double
-        k_loc(0, 0) = 12:     k_loc(0, 1) = 6 * le:      k_loc(0, 2) = -12:      k_loc(0, 3) = 6 * le
-        k_loc(1, 0) = 6 * le: k_loc(1, 1) = 4 * le * le: k_loc(1, 2) = -6 * le: k_loc(1, 3) = 2 * le * le
-        k_loc(2, 0) = -12:    k_loc(2, 1) = -6 * le:     k_loc(2, 2) = 12:      k_loc(2, 3) = -6 * le
-        k_loc(3, 0) = 6 * le: k_loc(3, 1) = 2 * le * le: k_loc(3, 2) = -6 * le: k_loc(3, 3) = 4 * le * le
-        
+
+        ElementStiffness le, k_loc
+
         Dim r_idx As Long, c_idx As Long
+
         For r_idx = 0 To 3
-            Dim f_val As Double: f_val = 0
+            Dim f_val As Double
+            f_val = 0
+
             For c_idx = 0 To 3
-                f_val = f_val + (k_loc(r_idx, c_idx) * Coeff * u_loc(c_idx))
+                f_val = f_val + _
+                        k_loc(r_idx, c_idx) * Coeff * u_loc(c_idx)
             Next c_idx
-            ' Internal force recovery: subtract element consistent load vector (k*u - f_elem_load)
+
             ElemForces(e, r_idx) = f_val - elemLoads(e, r_idx)
         Next r_idx
-        
-        ' FILL SHEAR OUTPUT (Stepped)
-        ' Local F0 is shear at start. Local F2 is shear force at end.
-        ' Standard convention: Shear is force exerted BY part ON node.
-        ' Reaction of element at left: Fy. Shear = Fy.
-        ' Reaction of element at right: Fy. Shear = -Fy.
-        
-        V_Out(e * 2) = ElemForces(e, 0) / 1000       ' Shear just inside left of element
-        V_Out(e * 2 + 1) = -ElemForces(e, 2) / 1000  ' Shear just inside right of element
+
+        V_Out(e * 2) = ElemForces(e, 0) / 1000
+        V_Out(e * 2 + 1) = -ElemForces(e, 2) / 1000
     Next e
-    
-    ' FILL MOMENT & DEFLECTION OUTPUT (Nodal Average)
+
     For e = 0 To nNodes - 1
         D_Out(e) = U(e * 2)
-        
+
         If e = 0 Then
             M_Out(e) = ElemForces(0, 1)
         ElseIf e = nNodes - 1 Then
@@ -836,133 +1935,318 @@ Sub CalculateForces(U() As Double, nElems As Long, elemLens() As Double, _
             M_right = ElemForces(e, 1)
             M_Out(e) = (M_left + M_right) / 2
         End If
+
         M_Out(e) = -M_Out(e) / 1000
     Next e
 End Sub
 
-Sub CalculateUDLEnvelopes(nSpans As Long, spanLens() As Double, w As Double, _
-                          nElems As Long, elemLens() As Double, nDOF As Long, _
+Sub CalculateUDLEnvelopes(nSpans As Long, spanLens() As Double, _
+                          w As Double, _
+                          nElems As Long, elemLens() As Double, _
+                          nDOF As Long, _
                           E_Modulus As Double, I_Inertia As Double, _
-                          K_Global() As Double, supportDOFs() As Long, nSupports As Long, _
-                          ByRef V_Max() As Double, ByRef V_Min() As Double, _
-                          ByRef M_Max() As Double, ByRef M_Min() As Double, _
-                          ByRef D_Max() As Double, ByRef D_Min() As Double, _
-                          ByRef UDL_MaxR() As Double, ByRef UDL_MinR() As Double)
-    
-    Dim nPatterns As Long: nPatterns = 2 ^ nSpans
-    Dim p As Long, s As Long, sIdx As Long
-    Dim F_UDL() As Double, U_UDL() As Double
-    Dim V() As Double, M() As Double, D() As Double
-    Dim curUDL_R() As Double
-    Dim idx As Long
-    
-    For sIdx = 0 To nSupports - 1
-        UDL_MaxR(sIdx) = -1E+20
-        UDL_MinR(sIdx) = 1E+20
-    Next sIdx
-    
-    For p = 0 To nPatterns - 1
-        ReDim F_UDL(nDOF - 1)
-        Dim elemLoads_UDL() As Double
-        ReDim elemLoads_UDL(nElems - 1, 3)
-        Dim elemCounter As Long: elemCounter = 0
-        
-        For s = 0 To nSpans - 1
-            Dim isLoaded As Boolean
-            isLoaded = ((p And (2 ^ s)) > 0)
-            Dim le As Double: le = spanLens(s) / N_ELEMS_PER_SPAN
-            
-            If isLoaded Then
-                Dim e As Long
-                For e = 1 To N_ELEMS_PER_SPAN
-                    Dim nI As Long: nI = elemCounter * 2
-                    Dim nJ As Long: nJ = (elemCounter + 1) * 2
-                    
-                    Dim Fy As Double, Mom As Double
-                    Fy = -w * le / 2 * 1000
-                    Mom = -w * le * le / 12 * 1000
-                    
-                    F_UDL(nI) = F_UDL(nI) + Fy
-                    F_UDL(nI + 1) = F_UDL(nI + 1) + Mom
-                    F_UDL(nJ) = F_UDL(nJ) + Fy
-                    F_UDL(nJ + 1) = F_UDL(nJ + 1) - Mom
-                    
-                    elemLoads_UDL(elemCounter, 0) = Fy
-                    elemLoads_UDL(elemCounter, 1) = Mom
-                    elemLoads_UDL(elemCounter, 2) = Fy
-                    elemLoads_UDL(elemCounter, 3) = -Mom
-                    elemCounter = elemCounter + 1
-                Next e
-            Else
-                elemCounter = elemCounter + N_ELEMS_PER_SPAN
-            End If
-        Next s
-        
-        U_UDL = SolveFactored(F_UDL, nDOF)
-        CalculateForces U_UDL, nElems, elemLens, V, M, D, E_Modulus, I_Inertia, elemLoads_UDL
-        CalculateSupportReactions K_Global, U_UDL, F_UDL, supportDOFs, nSupports, nDOF, curUDL_R
-        
-        ' Update Shear (Size 2*Elems)
-        For idx = 0 To UBound(V)
-            If V(idx) > V_Max(idx) Then V_Max(idx) = V(idx)
-            If V(idx) < V_Min(idx) Then V_Min(idx) = V(idx)
-        Next idx
-        
-        ' Update Mom/Def (Size nNodes)
-        For idx = 0 To UBound(M)
-            If M(idx) > M_Max(idx) Then M_Max(idx) = M(idx)
-            If M(idx) < M_Min(idx) Then M_Min(idx) = M(idx)
-            If D(idx) > D_Max(idx) Then D_Max(idx) = D(idx)
-            If D(idx) < D_Min(idx) Then D_Min(idx) = D(idx)
-        Next idx
-        
-        ' Update Reactions (Size nSupports)
-        For sIdx = 0 To nSupports - 1
-            If curUDL_R(sIdx) > UDL_MaxR(sIdx) Then UDL_MaxR(sIdx) = curUDL_R(sIdx)
-            If curUDL_R(sIdx) < UDL_MinR(sIdx) Then UDL_MinR(sIdx) = curUDL_R(sIdx)
-        Next sIdx
-    Next p
+                          K_Global() As Double, supportDOFs() As Long, _
+                          nSupports As Long, _
+                          ByRef V_Max() As Double, _
+                          ByRef V_Min() As Double, _
+                          ByRef M_Max() As Double, _
+                          ByRef M_Min() As Double, _
+                          ByRef D_Max() As Double, _
+                          ByRef D_Min() As Double, _
+                          ByRef UDL_MaxR() As Double, _
+                          ByRef UDL_MinR() As Double)
+
+    If nElems < 1 Or nElems > MAX_TOTAL_ELEMENTS Or _
+       nDOF <> 2 * (nElems + 1) Or w < 0# Then
+        Err.Raise vbObjectError + 10, "CalculateUDLEnvelopes", _
+                  "Invalid UDL intensity or FEM size."
+    End If
+
+    Dim nV As Long, nM As Long, nResponses As Long
+    nV = 2 * nElems
+    nM = nElems + 1
+    nResponses = nV + 2 * nM + nSupports
+
+    BuildInfluenceCache nElems, elemLens, nDOF, E_Modulus, I_Inertia, K_Global, supportDOFs, nSupports
+    m_UDLEnvelopesReady = False
+    m_UDLIntensity = w
+    ReDim m_UDLMax(nResponses - 1), m_UDLMin(nResponses - 1)
+    ReDim V_Max(nV - 1), V_Min(nV - 1)
+    ReDim M_Max(nM - 1), M_Min(nM - 1)
+    ReDim D_Max(nM - 1), D_Min(nM - 1)
+    ReDim UDL_MaxR(nSupports - 1), UDL_MinR(nSupports - 1)
+
+    Dim e As Long, r As Long, k As Long, i As Long
+    Dim coeff() As Double
+    Dim cuts() As Double, nCuts As Long, area As Double
+    ReDim coeff(3)
+
+    For e = 0 To nElems - 1
+        If (e Mod 10) = 0 Then
+            DoEvents
+            Application.StatusBar = "UDL influence zones: element " & _
+                                    (e + 1) & " of " & nElems
+        End If
+
+        For r = 0 To nResponses - 1
+            For k = 0 To 3
+                coeff(k) = m_InfluenceCoeffs(e, r, k)
+            Next k
+
+            InfluenceCuts coeff, cuts, nCuts
+            For i = 0 To nCuts - 2
+                area = w * elemLens(e) * _
+                       InfluenceIntegral(coeff, cuts(i), cuts(i + 1))
+                If area > 0# Then
+                    m_UDLMax(r) = m_UDLMax(r) + area
+                Else
+                    m_UDLMin(r) = m_UDLMin(r) + area
+                End If
+            Next i
+        Next r
+    Next e
+
+    For i = 0 To nV - 1
+        V_Max(i) = m_UDLMax(i)
+        V_Min(i) = m_UDLMin(i)
+    Next i
+    For i = 0 To nM - 1
+        M_Max(i) = m_UDLMax(nV + i)
+        M_Min(i) = m_UDLMin(nV + i)
+        D_Max(i) = m_UDLMax(nV + nM + i)
+        D_Min(i) = m_UDLMin(nV + nM + i)
+    Next i
+    For i = 0 To nSupports - 1
+        UDL_MaxR(i) = m_UDLMax(nV + 2 * nM + i)
+        UDL_MinR(i) = m_UDLMin(nV + 2 * nM + i)
+    Next i
+    m_UDLEnvelopesReady = True
 End Sub
 
-' Calculates reactions at all constrained support nodes: R = (K*U - F) / 1000 (kN, upward positive).
-Sub CalculateSupportReactions(K() As Double, U() As Double, F() As Double, _
-                             supportDOFs() As Long, nSupports As Long, nDOF As Long, _
-                             ByRef outR() As Double)
+Private Sub BuildInfluenceCache(nElems As Long, elemLens() As Double, nDOF As Long, _
+    E_Val As Double, I_Val As Double, K_Global() As Double, _
+    supportDOFs() As Long, nSupports As Long)
+    If m_InfluenceReady Then
+        If UBound(m_InfluenceCoeffs, 1) <> nElems - 1 Then _
+            Err.Raise vbObjectError + 21, "BuildInfluenceCache", "Influence cache does not match the factorized model."
+        Exit Sub
+    End If
+    If nElems < 1 Or nElems > MAX_TOTAL_ELEMENTS Or nDOF <> 2 * (nElems + 1) Then _
+        Err.Raise vbObjectError + 21, "BuildInfluenceCache", "Invalid influence model size."
+    Dim nResponses As Long, e As Long, p As Long, r As Long, power As Long
+    Dim F() As Double, U() As Double, loads() As Double, V() As Double, M() As Double, D() As Double
+    Dim reactions() As Double, values() As Double, samples() As Double, coeff() As Double
+    nResponses = 4 * nElems + 2 + nSupports
+    ReDim m_InfluenceCoeffs(nElems - 1, nResponses - 1, 3)
+    ReDim samples(3, nResponses - 1)
+    For e = 0 To nElems - 1
+        If e Mod 10 = 0 Then
+            DoEvents
+            Application.StatusBar = "Generating influence functions: element " & (e + 1) & " of " & nElems
+        End If
+        For p = 0 To 3
+            ReDim F(nDOF - 1), loads(nElems - 1, 3)
+            AddElementPointLoad F, loads, e, elemLens(e), 0.125 + 0.25 * p, 1#
+            U = SolveFactored(F, nDOF)
+            CalculateForces U, nElems, elemLens, V, M, D, E_Val, I_Val, loads
+            CalculateSupportReactions K_Global, U, F, supportDOFs, nSupports, nDOF, reactions
+            PackResponses V, M, D, reactions, values
+            For r = 0 To nResponses - 1: samples(p, r) = values(r): Next r
+        Next p
+        For r = 0 To nResponses - 1
+            FitInfluenceCubic samples(0, r), samples(1, r), samples(2, r), samples(3, r), coeff
+            For power = 0 To 3: m_InfluenceCoeffs(e, r, power) = coeff(power): Next power
+        Next r
+    Next e
+    m_InfluenceReady = True
+End Sub
+
+Private Sub PackResponses(V() As Double, M() As Double, D() As Double, _
+                          reactions() As Double, ByRef values() As Double)
+    Dim i As Long, offset As Long
+    ReDim values(UBound(V) + UBound(M) + UBound(D) + UBound(reactions) + 3)
+    For i = 0 To UBound(V)
+        values(i) = V(i)
+    Next i
+    offset = UBound(V) + 1
+    For i = 0 To UBound(M)
+        values(offset + i) = M(i)
+    Next i
+    offset = offset + UBound(M) + 1
+    For i = 0 To UBound(D)
+        values(offset + i) = D(i)
+    Next i
+    offset = offset + UBound(D) + 1
+    For i = 0 To UBound(reactions)
+        values(offset + i) = reactions(i)
+    Next i
+End Sub
+
+Private Sub FitInfluenceCubic(y0 As Double, y1 As Double, _
+                              y2 As Double, y3 As Double, _
+                              ByRef coeff() As Double)
+    Dim d1 As Double, d2 As Double, d3 As Double
+    d1 = y1 - y0
+    d2 = y2 - 2# * y1 + y0
+    d3 = y3 - 3# * y2 + 3# * y1 - y0
+    ReDim coeff(3)
+    coeff(0) = y0 - 0.5 * d1 + 0.375 * d2 - 0.3125 * d3
+    coeff(1) = 4# * d1 - 4# * d2 + 23# * d3 / 6#
+    coeff(2) = 8# * d2 - 12# * d3
+    coeff(3) = 32# * d3 / 3#
+End Sub
+
+Private Function InfluenceValue(coeff() As Double, xi As Double) As Double
+    InfluenceValue = ((coeff(3) * xi + coeff(2)) * xi + coeff(1)) * xi + coeff(0)
+End Function
+
+Private Function InfluenceIntegral(coeff() As Double, _
+                                   a As Double, b As Double) As Double
+    InfluenceIntegral = (b - a) * (coeff(0) + coeff(1) * (a + b) / 2# + _
+        coeff(2) * (a * a + a * b + b * b) / 3# + _
+        coeff(3) * (a ^ 3 + a * a * b + a * b * b + b ^ 3) / 4#)
+End Function
+
+Private Sub InfluenceCuts(coeff() As Double, ByRef cuts() As Double, _
+                          ByRef nCuts As Long)
+    Dim coeffScale As Double, k As Long
+    For k = 0 To 3
+        If Abs(coeff(k)) > coeffScale Then coeffScale = Abs(coeff(k))
+    Next k
+    ReDim cuts(7)
+    nCuts = 0
+    InsertInfluenceCut cuts, nCuts, 0#
+    InsertInfluenceCut cuts, nCuts, 1#
+    If coeffScale = 0# Then Exit Sub
+
+    Dim stationary(3) As Double, nStationary As Long
+    TruckStationaryCuts coeff, stationary, nStationary, True
+    SortInfluenceCuts stationary, nStationary
+
+    Dim i As Long, iteration As Long
+    Dim a As Double, b As Double, midpoint As Double
+    Dim fa As Double, fb As Double, fm As Double
+    For i = 0 To nStationary - 1
+        If Abs(InfluenceValue(coeff, stationary(i)) / coeffScale) <= _
+           INFLUENCE_VALUE_TOL Then
+            InsertInfluenceCut cuts, nCuts, stationary(i)
+        End If
+    Next i
+    For i = 0 To nStationary - 2
+        a = stationary(i)
+        b = stationary(i + 1)
+        fa = InfluenceValue(coeff, a) / coeffScale
+        fb = InfluenceValue(coeff, b) / coeffScale
+        If Abs(fa) > INFLUENCE_VALUE_TOL And _
+           Abs(fb) > INFLUENCE_VALUE_TOL And fa * fb < 0# Then
+            For iteration = 1 To 64
+                midpoint = (a + b) / 2#
+                fm = InfluenceValue(coeff, midpoint) / coeffScale
+                If fm = 0# Then
+                    a = midpoint
+                    b = midpoint
+                    Exit For
+                ElseIf fa * fm < 0# Then
+                    b = midpoint
+                Else
+                    a = midpoint
+                    fa = fm
+                End If
+                If b - a <= INFLUENCE_ROOT_TOL Then Exit For
+            Next iteration
+            InsertInfluenceCut cuts, nCuts, (a + b) / 2#
+        End If
+    Next i
+    SortInfluenceCuts cuts, nCuts
+End Sub
+
+Private Sub InsertInfluenceCut(ByRef cuts() As Double, ByRef nCuts As Long, _
+                               xi As Double)
+    If xi < -INFLUENCE_ROOT_TOL Or xi > 1# + INFLUENCE_ROOT_TOL Then Exit Sub
+    If xi < 0# Then xi = 0#
+    If xi > 1# Then xi = 1#
+    Dim i As Long
+    For i = 0 To nCuts - 1
+        If Abs(cuts(i) - xi) <= INFLUENCE_ROOT_TOL Then Exit Sub
+    Next i
+    If nCuts > UBound(cuts) Then ReDim Preserve cuts(nCuts + 3)
+    cuts(nCuts) = xi
+    nCuts = nCuts + 1
+End Sub
+
+Private Sub SortInfluenceCuts(ByRef cuts() As Double, nCuts As Long)
+    Dim i As Long, j As Long, value As Double
+    For i = 1 To nCuts - 1
+        value = cuts(i)
+        j = i - 1
+        Do While j >= 0
+            If cuts(j) <= value Then Exit Do
+            cuts(j + 1) = cuts(j)
+            j = j - 1
+        Loop
+        cuts(j + 1) = value
+    Next i
+End Sub
+
+Sub CalculateSupportReactions(K() As Double, U() As Double, _
+                              F() As Double, _
+                              supportDOFs() As Long, nSupports As Long, _
+                              nDOF As Long, ByRef outR() As Double)
+
     Dim s As Long, j As Long
     Dim dof As Long
     Dim rVal As Double
-    
+
     ReDim outR(nSupports - 1)
+
     For s = 0 To nSupports - 1
         dof = supportDOFs(s)
         rVal = 0#
+
         For j = 0 To nDOF - 1
             rVal = rVal + K(dof, j) * U(j)
         Next j
+
         rVal = rVal - F(dof)
-        outR(s) = rVal / 1000# ' Convert N to kN (upward positive)
+        outR(s) = rVal / 1000#
     Next s
 End Sub
 
-' Computes overall maximum and minimum reaction for each support across all truck positions,
-' along with the governing truck position producing the peak maximum reaction.
-Sub ComputeSupportSummary(MaxR() As Double, MinR() As Double, xTruck() As Double, _
-                          nSteps As Long, nSupports As Long, _
-                          ByRef outMax() As Double, ByRef outMin() As Double, ByRef outGovPos() As Double)
+Sub ComputeSupportSummary(MaxR() As Double, MinR() As Double, _
+                          xTruck() As Double, nSteps As Long, _
+                          nSupports As Long, _
+                          ByRef outMax() As Double, _
+                          ByRef outMin() As Double, _
+                          ByRef outGovPos() As Double, _
+                          Optional useOptimized As Boolean = False)
+
     Dim s As Long, p As Long
+
     ReDim outMax(nSupports - 1)
     ReDim outMin(nSupports - 1)
     ReDim outGovPos(nSupports - 1)
-    
+    If useOptimized Then
+        If Not m_OptimizedSupportReady Then _
+            Err.Raise vbObjectError + 22, "ComputeSupportSummary", "Optimized support reactions are not available."
+        For s = 0 To nSupports - 1
+            outMax(s) = m_OptimizedSupport(0, s)
+            outMin(s) = m_OptimizedSupport(1, s)
+            outGovPos(s) = m_OptimizedSupport(2, s)
+        Next s
+        Exit Sub
+    End If
+
     For s = 0 To nSupports - 1
         outMax(s) = -1E+20
         outMin(s) = 1E+20
         outGovPos(s) = 0#
+
         For p = 0 To nSteps - 1
             If MaxR(p, s) > outMax(s) Then
                 outMax(s) = MaxR(p, s)
                 outGovPos(s) = xTruck(p)
             End If
+
             If MinR(p, s) < outMin(s) Then
                 outMin(s) = MinR(p, s)
             End If
@@ -970,338 +2254,790 @@ Sub ComputeSupportSummary(MaxR() As Double, MinR() As Double, xTruck() As Double
     Next s
 End Sub
 
-' --- UTILITY FUNCTIONS ---
+Function ComputeEffectiveIncrement( _
+    baseInc As Double, spanLengths() As Double, numSpans As Long, _
+    spacings() As Double, nAxles As Long, _
+    truckLen As Double, totalLength As Double, _
+    nElemsPerSpan As Long) As Double
 
-' Adaptive sweep step - TypeScript computeEffectiveIncrement parity.
-' Effective = min(base, minSpan/40, minElemLen, minAxleSpacing/8), floored at
-' MIN_SWEEP_STEP, capped so uniform steps <= MAX_SWEEP_STEPS, rounded UP to 5 mm.
-' Support alignments are always added explicitly, so support peaks stay exact.
-Function ComputeEffectiveIncrement(baseInc As Double, spanLengths() As Double, numSpans As Long, _
-                                   spacings() As Double, nAxles As Long, _
-                                   truckLen As Double, totalLength As Double, _
-                                   nElemsPerSpan As Long) As Double
     Dim i As Long
-    Dim minSpan As Double: minSpan = 1E+30
+    Dim minSpan As Double
+    minSpan = 1E+30
+
     For i = 0 To numSpans - 1
-        If spanLengths(i) > 0 And spanLengths(i) < minSpan Then minSpan = spanLengths(i)
+        If spanLengths(i) > 0 And spanLengths(i) < minSpan Then
+            minSpan = spanLengths(i)
+        End If
     Next i
+
     If minSpan > 1E+29 Or baseInc <= 0 Then
         ComputeEffectiveIncrement = baseInc
         Exit Function
     End If
-    
-    Dim denom As Long: denom = nElemsPerSpan
+
+    Dim denom As Long
+    denom = nElemsPerSpan
     If denom < 2 Then denom = 2
-    Dim minElem As Double: minElem = minSpan / denom
-    
-    Dim minGap As Double: minGap = 1E+30
+
+    Dim minElem As Double
+    minElem = minSpan / denom
+
+    Dim minGap As Double
+    minGap = 1E+30
+
     For i = 0 To nAxles - 2
-        If spacings(i) > 0 And spacings(i) < minGap Then minGap = spacings(i)
+        If spacings(i) > 0 And spacings(i) < minGap Then
+            minGap = spacings(i)
+        End If
     Next i
-    
-    Dim eff As Double: eff = baseInc
-    Dim cand As Double
+
+    Dim eff As Double, cand As Double
+    eff = baseInc
+
     cand = minSpan / 40#
     If cand > 0 And cand < eff Then eff = cand
+
     cand = minElem
     If cand > 0 And cand < eff Then eff = cand
+
     If minGap < 1E+29 Then
         cand = minGap / 8#
         If cand > 0 And cand < eff Then eff = cand
     End If
-    
+
     If eff < MIN_SWEEP_STEP Then eff = MIN_SWEEP_STEP
-    
-    Dim sweepLen As Double: sweepLen = totalLength + 2# * truckLen
-    If sweepLen / eff > MAX_SWEEP_STEPS Then eff = sweepLen / MAX_SWEEP_STEPS
-    
-    ' Round UP to 5 mm (ceil to 1/200 m); rounding up never refines beyond need
+
+    Dim sweepLen As Double
+    sweepLen = totalLength + 2# * truckLen
+
+    If sweepLen / eff > MAX_SWEEP_STEPS Then
+        eff = sweepLen / MAX_SWEEP_STEPS
+    End If
+
     eff = -Int(-eff * 200#) / 200#
+
     If eff > baseInc Then eff = baseInc
     If eff <= 0 Then eff = baseInc
-    
+
     ComputeEffectiveIncrement = eff
 End Function
 
-' Calculates maximum number of consecutive axles that can simultaneously fit on any span of length maxSpan.
-Function CalculateMaxAxlesOnSpan(maxSpan As Double, spacings() As Double, nAxles As Long) As Long
-    Dim maxCount As Long: maxCount = 1
-    Dim i As Long, j As Long
-    Dim cumDist As Double
-    Dim count As Long
-    
-    For i = 0 To nAxles - 1
-        count = 1
-        cumDist = 0#
-        For j = i To nAxles - 2
-            cumDist = cumDist + spacings(j)
-            If cumDist <= maxSpan + 0.000001 Then
-                count = count + 1
-            Else
-                Exit For
-            End If
-        Next j
-        If count > maxCount Then maxCount = count
-    Next i
-    CalculateMaxAxlesOnSpan = maxCount
-End Function
-
-' Factorises the reduced (free DOF) stiffness matrix once into L\U form.
-' The moving-load loop then costs O(n^2) per position instead of O(n^3), which is what
-' makes a fine mesh / small truck increment practical.
 Sub FactorizeSystem(K() As Double, constrained() As Boolean, n As Long)
+    m_InfluenceReady = False
+    m_UDLEnvelopesReady = False
+    m_UDLIntensity = 0#
+    m_OptimizedSupportReady = False
+    m_TruckGovReady = False
+    Erase m_InfluenceCoeffs
+    Erase m_UDLMax
+    Erase m_UDLMin
     Dim i As Long, j As Long, k_idx As Long
-    
+
     ReDim m_map(n - 1)
     m_nFree = 0
+
     For i = 0 To n - 1
         If Not constrained(i) Then
             m_map(m_nFree) = i
             m_nFree = m_nFree + 1
         End If
     Next i
-    
-    If m_nFree < 1 Then Err.Raise vbObjectError + 1, , "The model has no free degrees of freedom."
-    
+
+    If m_nFree < 1 Then
+        Err.Raise vbObjectError + 1, , _
+                  "The model has no free degrees of freedom."
+    End If
+
     ReDim m_LU(m_nFree - 1, m_nFree - 1)
+    m_Bandwidth = 0
+
     For i = 0 To m_nFree - 1
         For j = 0 To m_nFree - 1
             m_LU(i, j) = K(m_map(i), m_map(j))
+            If m_LU(i, j) <> 0# Then
+                If Abs(i - j) > m_Bandwidth Then m_Bandwidth = Abs(i - j)
+            End If
         Next j
     Next i
-    
-    ' Doolittle LU. No pivoting required: the reduced beam matrix is symmetric positive definite.
-    Dim factor As Double
+
+    Dim factor As Double, last As Long
+
+    ' No-pivot LU preserves the measured band; do not process structural zeros.
     For k_idx = 0 To m_nFree - 2
         If m_LU(k_idx, k_idx) = 0 Then
-            Err.Raise vbObjectError + 2, , "Singular stiffness matrix - check span lengths and supports."
+            Err.Raise vbObjectError + 2, , _
+                      "Singular stiffness matrix - check span lengths and supports."
         End If
-        For i = k_idx + 1 To m_nFree - 1
+
+        last = k_idx + m_Bandwidth
+        If last >= m_nFree Then last = m_nFree - 1
+        For i = k_idx + 1 To last
             factor = m_LU(i, k_idx) / m_LU(k_idx, k_idx)
             m_LU(i, k_idx) = factor
-            For j = k_idx + 1 To m_nFree - 1
-                m_LU(i, j) = m_LU(i, j) - factor * m_LU(k_idx, j)
+
+            For j = k_idx + 1 To last
+                m_LU(i, j) = m_LU(i, j) - _
+                              factor * m_LU(k_idx, j)
             Next j
         Next i
     Next k_idx
-    
+
     If m_LU(m_nFree - 1, m_nFree - 1) = 0 Then
-        Err.Raise vbObjectError + 2, , "Singular stiffness matrix - check span lengths and supports."
+        Err.Raise vbObjectError + 2, , _
+                  "Singular stiffness matrix - check span lengths and supports."
     End If
 End Sub
 
-' Solves K*U = F for the current load vector using the cached factorisation.
 Function SolveFactored(F() As Double, n As Long) As Double()
-    Dim i As Long, j As Long
+    Dim i As Long, j As Long, first As Long, last As Long
     Dim sumVal As Double
     Dim y() As Double
+
     ReDim y(m_nFree - 1)
-    
+
     For i = 0 To m_nFree - 1
         y(i) = F(m_map(i))
     Next i
-    
-    ' Forward substitution (unit lower triangular L)
+
     For i = 1 To m_nFree - 1
         sumVal = 0
-        For j = 0 To i - 1
+
+        first = i - m_Bandwidth
+        If first < 0 Then first = 0
+        For j = first To i - 1
             sumVal = sumVal + m_LU(i, j) * y(j)
         Next j
+
         y(i) = y(i) - sumVal
     Next i
-    
-    ' Back substitution (upper triangular U)
+
     For i = m_nFree - 1 To 0 Step -1
         sumVal = 0
-        For j = i + 1 To m_nFree - 1
+
+        last = i + m_Bandwidth
+        If last >= m_nFree Then last = m_nFree - 1
+        For j = i + 1 To last
             sumVal = sumVal + m_LU(i, j) * y(j)
         Next j
+
         y(i) = (y(i) - sumVal) / m_LU(i, i)
     Next i
-    
+
     Dim U_Full() As Double
     ReDim U_Full(n - 1)
+
     For i = 0 To m_nFree - 1
         U_Full(m_map(i)) = y(i)
     Next i
+
     SolveFactored = U_Full
 End Function
 
 Sub ApplyPointLoad(ByRef F() As Double, pos As Double, mag As Double, _
-                   nElems As Long, elemLens() As Double, spanLens() As Double, _
+                   nElems As Long, elemLens() As Double, _
+                   spanLens() As Double, _
                    ByRef elemLoads() As Double)
-    Dim totLen As Double: totLen = 0
+
+    Dim totLen As Double
+    totLen = 0
+
     Dim i As Long
-    For i = 0 To UBound(spanLens): totLen = totLen + spanLens(i): Next i
-    
-    If pos < -0.0001 Or pos > totLen + 0.0001 Then Exit Sub
+    For i = 0 To UBound(spanLens)
+        totLen = totLen + spanLens(i)
+    Next i
+
+    If pos < -POINT_LOAD_POSITION_TOL Or pos > totLen + POINT_LOAD_POSITION_TOL Then Exit Sub
     If pos < 0# Then pos = 0#
     If pos > totLen Then pos = totLen
-    
+
     Dim curX As Double, elemIdx As Long
     Dim le As Double, localX As Double
+
     curX = 0
     elemIdx = -1
-    
+
     For i = 0 To nElems - 1
         le = elemLens(i)
+
         If pos <= curX + le + 0.000001 Then
             elemIdx = i
             localX = pos - curX
             Exit For
         End If
+
         curX = curX + le
     Next i
-    
-    ' Fallback if floating point drift pushes pos past the last element edge
+
     If elemIdx < 0 Then
         elemIdx = nElems - 1
         le = elemLens(elemIdx)
         localX = le
     End If
-    
-    Dim xi As Double: xi = localX / le
+
+    Dim xi As Double
+    xi = localX / le
+
     If xi < 0 Then xi = 0
     If xi > 1 Then xi = 1
-    
-    Dim N1 As Double, N2 As Double, N3 As Double, N4 As Double
-    
+
+    AddElementPointLoad F, elemLoads, elemIdx, le, xi, mag
+End Sub
+
+Private Sub AddElementPointLoad(ByRef F() As Double, _
+                                ByRef elemLoads() As Double, _
+                                elemIdx As Long, le As Double, _
+                                xi As Double, mag As Double)
+    Dim N1 As Double, N2 As Double
+    Dim N3 As Double, N4 As Double
+
     N1 = 1 - 3 * xi * xi + 2 * xi * xi * xi
     N2 = le * (xi - 2 * xi * xi + xi * xi * xi)
     N3 = 3 * xi * xi - 2 * xi * xi * xi
     N4 = le * (-xi * xi + xi * xi * xi)
-    
-    Dim dofI As Long: dofI = elemIdx * 2
-    Dim dofJ As Long: dofJ = (elemIdx + 1) * 2
-    
-    Dim f0 As Double, f1 As Double, f2 As Double, f3 As Double
+
+    Dim f0 As Double, f1 As Double
+    Dim f2 As Double, f3 As Double
+
     f0 = -mag * N1 * 1000
     f1 = -mag * N2 * 1000
     f2 = -mag * N3 * 1000
     f3 = -mag * N4 * 1000
-    
+
+    AddElementLoadVector F, elemLoads, elemIdx, f0, f1, f2, f3
+End Sub
+
+Private Sub AddElementLoadVector(ByRef F() As Double, _
+                                 ByRef elemLoads() As Double, _
+                                 elemIdx As Long, f0 As Double, f1 As Double, _
+                                 f2 As Double, f3 As Double)
+    Dim dofI As Long, dofJ As Long
+    dofI = elemIdx * 2
+    dofJ = (elemIdx + 1) * 2
+
     F(dofI) = F(dofI) + f0
     F(dofI + 1) = F(dofI + 1) + f1
     F(dofJ) = F(dofJ) + f2
     F(dofJ + 1) = F(dofJ + 1) + f3
-    
+
     elemLoads(elemIdx, 0) = elemLoads(elemIdx, 0) + f0
     elemLoads(elemIdx, 1) = elemLoads(elemIdx, 1) + f1
     elemLoads(elemIdx, 2) = elemLoads(elemIdx, 2) + f2
     elemLoads(elemIdx, 3) = elemLoads(elemIdx, 3) + f3
 End Sub
 
-Sub OutputResults(loadCase As Long, xNodes() As Double, xShear() As Double, _
-                  supportX() As Double, xTruckSteps() As Double, nSupports As Long, _
-                  TrkMaxV() As Double, TrkMinV() As Double, TrkMaxM() As Double, _
-                  TrkMinM() As Double, TrkMaxD() As Double, TrkMinD() As Double, _
-                  TrkMaxR() As Double, TrkMinR() As Double, _
-                  TrkSuppMaxR() As Double, TrkSuppMinR() As Double, TrkSuppGovPos() As Double, _
-                  LneMaxV() As Double, LneMinV() As Double, LneMaxM() As Double, _
-                  LneMinM() As Double, LneMaxD() As Double, LneMinD() As Double, _
-                  LneMaxR() As Double, LneMinR() As Double, _
-                  LneSuppMaxR() As Double, LneSuppMinR() As Double, LneSuppGovPos() As Double, _
-                  EnvMaxV() As Double, EnvMinV() As Double, EnvMaxM() As Double, _
-                  EnvMinM() As Double, EnvMaxD() As Double, EnvMinD() As Double, _
-                  EnvMaxR() As Double, EnvMinR() As Double, _
-                  EnvSuppMaxR() As Double, EnvSuppMinR() As Double, EnvSuppGovPos() As Double, _
-                  DLA_Val As Double, isDlaOverridden As Boolean)
-    Dim ws As Worksheet
-    On Error Resume Next
-    Application.DisplayAlerts = False
-    ThisWorkbook.Sheets("Results").Delete
-    Application.DisplayAlerts = True
-    On Error GoTo 0
-    
-    Set ws = ThisWorkbook.Sheets.Add
-    ws.Name = "Results"
-    
-    Dim nextCol As Long
-    Dim chartLeft As Double
-    
-    Select Case loadCase
-        Case 1
-            WriteResultBlock ws, 1, "Truck", xNodes, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, _
-                             xShear, TrkMaxV, TrkMinV, _
-                             supportX, TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos, _
-                             xTruckSteps, TrkMaxR, TrkMinR, nSupports, nextCol, _
-                             DLA_Val, isDlaOverridden
-            ws.Columns.AutoFit
-            chartLeft = ws.Cells(1, nextCol).Left + 20
-            CreateResultCharts ws, "Truck", 1, nSupports, supportX, _
-                               UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, _
-                               chartLeft
-            
-        Case 2
-            WriteResultBlock ws, 1, "Lane", xNodes, LneMaxM, LneMinM, LneMaxD, LneMinD, _
-                             xShear, LneMaxV, LneMinV, _
-                             supportX, LneSuppMaxR, LneSuppMinR, LneSuppGovPos, _
-                             xTruckSteps, LneMaxR, LneMinR, nSupports, nextCol, _
-                             0#, False
-            ws.Columns.AutoFit
-            chartLeft = ws.Cells(1, nextCol).Left + 20
-            CreateResultCharts ws, "Lane", 1, nSupports, supportX, _
-                               UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, _
-                               chartLeft
-            
+Private Sub ApplyPartialUDL(ByRef F() As Double, _
+                            ByRef elemLoads() As Double, _
+                            e As Long, le As Double, w As Double, _
+                            a As Double, b As Double)
+    If e < 0 Or e > UBound(elemLoads, 1) Or le <= 0# Or w < 0# Or _
+       a < 0# Or b > 1# Or a > b Then
+        Err.Raise vbObjectError + 11, "ApplyPartialUDL", _
+                  "Invalid partial-element UDL interval or intensity."
+    End If
+
+    Dim i0 As Double, i1 As Double, i2 As Double, i3 As Double
+    Dim factor As Double
+    i0 = b - a
+    i1 = i0 * (a + b) / 2#
+    i2 = i0 * (a * a + a * b + b * b) / 3#
+    i3 = i0 * (a ^ 3 + a * a * b + a * b * b + b ^ 3) / 4#
+    factor = -w * le * 1000#
+    AddElementLoadVector F, elemLoads, e, _
+        factor * (i0 - 3# * i2 + 2# * i3), _
+        factor * le * (i1 - 2# * i2 + i3), _
+        factor * (3# * i2 - 2# * i3), _
+        factor * le * (-i2 + i3)
+End Sub
+
+' ==============================================================================
+' OUTPUT
+' ==============================================================================
+
+Private Sub ResolveUDLTracerResponse(wsIn As Worksheet, _
+                                     xNodes() As Double, xShear() As Double, _
+                                     supportX() As Double, _
+                                     ByRef responseIndex As Long, _
+                                     ByRef responseTitle As String, _
+                                     ByRef units As String)
+    If Len(Trim$(CStr(wsIn.Range(INPUT_TRACER_RESPONSE_CELL).Value))) = 0 Then
+        wsIn.Range(INPUT_TRACER_RESPONSE_CELL).Value = "Moment"
+    End If
+
+    Dim kind As String, count As Long, offset As Long, autoIndex As Long
+    Dim nV As Long, nM As Long, i As Long, centralNode As Long
+    Dim middle As Double, distance As Double, bestDistance As Double
+    nV = UBound(xShear) + 1
+    nM = UBound(xNodes) + 1
+    middle = xNodes(nM - 1) / 2#
+    bestDistance = xNodes(nM - 1) + 1#
+    For i = 0 To nM - 1
+        distance = Abs(xNodes(i) - middle)
+        If distance < bestDistance Then
+            bestDistance = distance
+            centralNode = i
+        End If
+    Next i
+
+    kind = LCase$(Trim$(CStr(wsIn.Range(INPUT_TRACER_RESPONSE_CELL).Value)))
+    Select Case kind
+        Case "moment"
+            count = nM
+            offset = nV
+            autoIndex = centralNode + 1
+            units = "kNm"
+        Case "deflection"
+            count = nM
+            offset = nV + nM
+            autoIndex = centralNode + 1
+            units = "m"
+        Case "shear"
+            count = nV
+            autoIndex = 2 * centralNode + 1
+            If autoIndex > count Then autoIndex = count
+            units = "kN"
+        Case "reaction"
+            count = UBound(supportX) + 1
+            offset = nV + 2 * nM
+            autoIndex = 1
+            units = "kN"
         Case Else
-            Dim col2 As Long, col3 As Long
-            WriteResultBlock ws, 1, "Truck", xNodes, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, _
-                             xShear, TrkMaxV, TrkMinV, _
-                             supportX, TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos, _
-                             xTruckSteps, TrkMaxR, TrkMinR, nSupports, col2, _
-                             DLA_Val, isDlaOverridden
-            
-            WriteResultBlock ws, col2, "Lane", xNodes, LneMaxM, LneMinM, LneMaxD, LneMinD, _
-                             xShear, LneMaxV, LneMinV, _
-                             supportX, LneSuppMaxR, LneSuppMinR, LneSuppGovPos, _
-                             xTruckSteps, LneMaxR, LneMinR, nSupports, col3, _
-                             0#, False
-            
-            WriteResultBlock ws, col3, "Envelope", xNodes, EnvMaxM, EnvMinM, EnvMaxD, EnvMinD, _
-                             xShear, EnvMaxV, EnvMinV, _
-                             supportX, EnvSuppMaxR, EnvSuppMinR, EnvSuppGovPos, _
-                             xTruckSteps, EnvMaxR, EnvMinR, nSupports, nextCol, _
-                             DLA_Val, isDlaOverridden
-            
-            ws.Columns.AutoFit
-            chartLeft = ws.Cells(1, nextCol).Left + 20
-            
-            CreateResultCharts ws, "Truck", 1, nSupports, supportX, _
-                               UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, _
-                               chartLeft
-            
-            CreateResultCharts ws, "Lane", col2, nSupports, supportX, _
-                               UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, _
-                               chartLeft + 630
-            
-            CreateResultCharts ws, "Envelope", col3, nSupports, supportX, _
-                               UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, _
-                               chartLeft + 1260
+            Err.Raise vbObjectError + 12, "ResolveUDLTracerResponse", _
+                      "UDL Tracer Response (B36) must be Moment, Shear, Deflection or Reaction."
+    End Select
+
+    Dim selected As Long, entered As Double
+    selected = autoIndex
+    If Len(Trim$(CStr(wsIn.Range(INPUT_TRACER_INDEX_CELL).Value))) > 0 Then
+        If Not IsNumeric(wsIn.Range(INPUT_TRACER_INDEX_CELL).Value) Then
+            Err.Raise vbObjectError + 13, "ResolveUDLTracerResponse", _
+                      "UDL Tracer Index (B37) must be a whole number."
+        End If
+        entered = CDbl(wsIn.Range(INPUT_TRACER_INDEX_CELL).Value)
+        If entered < 1# Or entered > count Or entered <> Fix(entered) Then
+            Err.Raise vbObjectError + 13, "ResolveUDLTracerResponse", _
+                      "UDL Tracer Index (B37) must be between 1 and " & count & "."
+        End If
+        selected = CLng(entered)
+    End If
+    responseIndex = offset + selected - 1
+
+    Select Case kind
+        Case "reaction"
+            responseTitle = "Reaction at support " & selected & " (x=" & _
+                            Format(supportX(selected - 1), "0.000") & " m)"
+        Case "shear"
+            responseTitle = "Shear at x=" & Format(xShear(selected - 1), "0.000") & _
+                            " m (index " & selected & ", element " & _
+                            ((selected - 1) \ 2 + 1) & _
+                            IIf((selected Mod 2) = 1, ", I end)", ", J end)")
+        Case Else
+            responseTitle = wsIn.Range(INPUT_TRACER_RESPONSE_CELL).Value & " at x=" & _
+                            Format(xNodes(selected - 1), "0.000") & _
+                            " m (node/index " & selected & ")"
     End Select
 End Sub
 
-' Writes one load case (moment/deflection at nodes, stepped shear, support reactions summary,
-' and reaction diagrams data vs truck position) starting at column col0.
+Private Sub WriteUDLTracer(wsIn As Worksheet, _
+                           xNodes() As Double, xShear() As Double, _
+                           supportX() As Double, nElems As Long, _
+                           elemLens() As Double, nDOF As Long, _
+                           E_Val As Double, I_Val As Double, _
+                           K_Global() As Double, supportDOFs() As Long, _
+                           nSupports As Long)
+    If Not m_InfluenceReady Or Not m_UDLEnvelopesReady Then
+        Err.Raise vbObjectError + 14, "WriteUDLTracer", _
+                  "No completed UDL influence analysis is available."
+    End If
+
+    Dim responseIndex As Long, responseTitle As String, units As String
+    ResolveUDLTracerResponse wsIn, xNodes, xShear, supportX, _
+                             responseIndex, responseTitle, units
+
+    Dim FMax() As Double, FMin() As Double
+    Dim loadsMax() As Double, loadsMin() As Double
+    ReDim FMax(nDOF - 1), FMin(nDOF - 1)
+    ReDim loadsMax(nElems - 1, 3), loadsMin(nElems - 1, 3)
+
+    Dim intervals() As Variant, nIntervals As Long
+    Dim plotData() As Variant, nPlotRows As Long
+    ReDim intervals(4, 4 * nElems - 1)
+    ReDim plotData(16 * nElems - 1, 3)
+
+    Dim e As Long, k As Long, i As Long, p As Long
+    Dim coeff() As Double, cuts() As Double, nCuts As Long
+    Dim plotCuts() As Double, nPlotCuts As Long
+    Dim area As Double, xi As Double, ordinate As Double
+    ReDim coeff(3)
+    For e = 0 To nElems - 1
+        For k = 0 To 3
+            coeff(k) = m_InfluenceCoeffs(e, responseIndex, k)
+        Next k
+        InfluenceCuts coeff, cuts, nCuts
+        For i = 0 To nCuts - 2
+            area = m_UDLIntensity * elemLens(e) * _
+                   InfluenceIntegral(coeff, cuts(i), cuts(i + 1))
+            If area > 0# Then
+                ApplyPartialUDL FMax, loadsMax, e, elemLens(e), _
+                                m_UDLIntensity, cuts(i), cuts(i + 1)
+                AppendUDLTraceInterval intervals, nIntervals, "Max", _
+                    xNodes(e) + elemLens(e) * cuts(i), _
+                    xNodes(e) + elemLens(e) * cuts(i + 1), area
+            ElseIf area < 0# Then
+                ApplyPartialUDL FMin, loadsMin, e, elemLens(e), _
+                                m_UDLIntensity, cuts(i), cuts(i + 1)
+                AppendUDLTraceInterval intervals, nIntervals, "Min", _
+                    xNodes(e) + elemLens(e) * cuts(i), _
+                    xNodes(e) + elemLens(e) * cuts(i + 1), area
+            End If
+        Next i
+
+        ReDim plotCuts(15)
+        nPlotCuts = 0
+        For p = 0 To 8
+            InsertInfluenceCut plotCuts, nPlotCuts, p / 8#
+        Next p
+        For i = 0 To nCuts - 1
+            InsertInfluenceCut plotCuts, nPlotCuts, cuts(i)
+        Next i
+        SortInfluenceCuts plotCuts, nPlotCuts
+        For p = 0 To nPlotCuts - 1
+            xi = plotCuts(p)
+            ordinate = InfluenceValue(coeff, xi)
+            plotData(nPlotRows, 0) = xNodes(e) + elemLens(e) * xi
+            plotData(nPlotRows, 1) = ordinate
+            If ordinate > 0# Then
+                plotData(nPlotRows, 2) = ordinate
+                plotData(nPlotRows, 3) = 0#
+            Else
+                plotData(nPlotRows, 2) = 0#
+                plotData(nPlotRows, 3) = ordinate
+            End If
+            nPlotRows = nPlotRows + 1
+        Next p
+    Next e
+
+    Dim reconstructedMax As Double, reconstructedMin As Double
+    reconstructedMax = ReconstructedUDLResponse(FMax, loadsMax, responseIndex, _
+        nElems, elemLens, nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports)
+    reconstructedMin = ReconstructedUDLResponse(FMin, loadsMin, responseIndex, _
+        nElems, elemLens, nDOF, E_Val, I_Val, K_Global, supportDOFs, nSupports)
+
+    Dim responseScale As Double, tolerance As Double
+    responseScale = Abs(m_UDLMax(responseIndex))
+    If Abs(m_UDLMin(responseIndex)) > responseScale Then _
+        responseScale = Abs(m_UDLMin(responseIndex))
+    If units = "m" Then
+        tolerance = 0.000000000001 + UDL_VERIFY_TOL * responseScale
+    Else
+        tolerance = 0.000000001 + UDL_VERIFY_TOL * responseScale
+    End If
+    If Abs(reconstructedMax - m_UDLMax(responseIndex)) > tolerance Or _
+       Abs(reconstructedMin - m_UDLMin(responseIndex)) > tolerance Then
+        Err.Raise vbObjectError + 15, "WriteUDLTracer", _
+                  "Partial-UDL FEM reconstruction failed for " & responseTitle & _
+                  ". Max: " & reconstructedMax & " versus " & m_UDLMax(responseIndex) & _
+                  "; Min: " & reconstructedMin & " versus " & m_UDLMin(responseIndex) & "."
+    End If
+
+    Dim ws As Worksheet, block As Range
+    Set ws = ThisWorkbook.Worksheets("LL Results")
+    Set block = PrepareUDLTracerBlock(ws)
+
+    block.Range("A1:K1").Merge
+    block.Range("A1").Value = "LANE UDL TRACER - INFLUENCE-ZONE LOADING"
+    block.Range("A1").Font.Bold = True
+    block.Range("A2").Value = "Response"
+    block.Range("B2").Value = responseTitle
+    block.Range("A3").Value = "Method"
+    block.Range("B3").Value = "Max: positive zones; Min: negative zones. UDL overlaps the truck."
+    block.Range("A4").Value = "UDL (kN/m)"
+    block.Range("B4").Value = m_UDLIntensity
+    block.Range("A5").Value = "UDL Max (" & units & ")"
+    block.Range("B5").Value = m_UDLMax(responseIndex)
+    block.Range("A6").Value = "UDL Min (" & units & ")"
+    block.Range("B6").Value = m_UDLMin(responseIndex)
+    block.Range("D4").Value = "Reconstructed FEM"
+    block.Range("D5").Value = "Max (" & units & ")"
+    block.Range("E5").Value = reconstructedMax
+    block.Range("D6").Value = "Min (" & units & ")"
+    block.Range("E6").Value = reconstructedMin
+    block.Range("A8").Value = "Verification"
+    block.Range("B8").Value = "Passed; absolute tolerance = " & _
+                           Format(tolerance, "0.000000000000E+00") & " " & units
+    block.Range("A9").Value = "Scope"
+    block.Range("B9").Value = "UDL only; each response has its own loading. Truck sweep unchanged."
+    block.Range("A10").Value = "Selection"
+    block.Range("B10").Value = "Set LL Input B36/B37 and rerun. Shear indices follow the stepped result rows."
+    block.Range("A12:E12").Value = Array("Envelope", "Start (m)", "End (m)", _
+                                     "Length (m)", "Contribution (" & units & ")")
+    block.Range("H12:K12").Value = Array("Load position (m)", "Influence ordinate", _
+                                     "Max UDL zones", "Min UDL zones")
+    block.Range("A12:K12").Font.Bold = True
+    block.Range("A12:K12").WrapText = True
+    block.Range("A12").EntireRow.RowHeight = 30
+
+    Dim output() As Variant
+    If nIntervals > 0 Then
+        ReDim output(nIntervals - 1, 4)
+        For i = 0 To nIntervals - 1
+            For k = 0 To 4
+                output(i, k) = intervals(k, i)
+            Next k
+        Next i
+        block.Range("A13").Resize(nIntervals, 5).Value = output
+        block.Range("B13").Resize(nIntervals, 4).NumberFormat = "0.000000"
+    Else
+        block.Range("A13").Value = "No nonzero favorable UDL intervals."
+    End If
+    ReDim output(nPlotRows - 1, 3)
+    For i = 0 To nPlotRows - 1
+        For k = 0 To 3
+            output(i, k) = plotData(i, k)
+        Next k
+    Next i
+    block.Range("H13").Resize(nPlotRows, 4).Value = output
+    block.Range("H13").Resize(nPlotRows, 4).NumberFormat = "0.000000000"
+    block.Range("B5:B6,E5:E6").NumberFormat = "0.000000000"
+    Dim noteRow As Variant
+    For Each noteRow In Array(2, 3, 8, 9, 10)
+        With block.Range("B" & noteRow & ":K" & noteRow)
+            .Merge
+            .WrapText = True
+        End With
+    Next noteRow
+    CreateUDLInfluenceChart ws, nPlotRows, responseTitle, units, block.Row
+End Sub
+
+Private Function PrepareUDLTracerBlock(ws As Worksheet) As Range
+    Dim previous As Range, lastCell As Range, oldChart As ChartObject
+    Set previous = ws.Columns(1).Find(What:="LANE UDL TRACER - INFLUENCE-ZONE LOADING", _
+        LookIn:=xlValues, LookAt:=xlWhole, SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    Set lastCell = ws.Cells.Find(What:="*", LookIn:=xlFormulas, LookAt:=xlPart, _
+        SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    If Not previous Is Nothing Then
+        With ws.Range(ws.Cells(previous.Row, 1), ws.Cells(lastCell.Row, 11))
+            .UnMerge
+            .Clear
+        End With
+        On Error Resume Next
+        Set oldChart = ws.ChartObjects("LLUDLInfluenceChart")
+        On Error GoTo 0
+        If Not oldChart Is Nothing Then oldChart.Delete
+        Set lastCell = ws.Cells.Find(What:="*", LookIn:=xlFormulas, LookAt:=xlPart, _
+            SearchOrder:=xlByRows, SearchDirection:=xlPrevious, MatchCase:=False)
+    End If
+    Dim firstRow As Long, chartBottom As Double, chart As ChartObject
+    firstRow = 1
+    If Not lastCell Is Nothing Then firstRow = lastCell.Row + 4
+    For Each chart In ws.ChartObjects
+        If chart.Top + chart.Height > chartBottom Then chartBottom = chart.Top + chart.Height
+    Next chart
+    Do While ws.Rows(firstRow).Top < chartBottom + 20#
+        firstRow = firstRow + 1
+    Loop
+    Set PrepareUDLTracerBlock = ws.Cells(firstRow, 1)
+End Function
+
+Private Sub AppendUDLTraceInterval(ByRef data() As Variant, _
+                                   ByRef nRows As Long, envelope As String, _
+                                   startX As Double, endX As Double, _
+                                   contribution As Double)
+    If nRows > 0 Then
+        If CStr(data(0, nRows - 1)) = envelope And _
+           Abs(CDbl(data(2, nRows - 1)) - startX) <= INFLUENCE_ROOT_TOL Then
+            data(2, nRows - 1) = endX
+            data(3, nRows - 1) = endX - CDbl(data(1, nRows - 1))
+            data(4, nRows - 1) = CDbl(data(4, nRows - 1)) + contribution
+            Exit Sub
+        End If
+    End If
+    If nRows > UBound(data, 2) Then ReDim Preserve data(4, 2 * nRows + 1)
+    data(0, nRows) = envelope
+    data(1, nRows) = startX
+    data(2, nRows) = endX
+    data(3, nRows) = endX - startX
+    data(4, nRows) = contribution
+    nRows = nRows + 1
+End Sub
+
+Private Function ReconstructedUDLResponse(F() As Double, elemLoads() As Double, _
+    responseIndex As Long, nElems As Long, elemLens() As Double, nDOF As Long, _
+    E_Val As Double, I_Val As Double, K_Global() As Double, _
+    supportDOFs() As Long, nSupports As Long) As Double
+    Dim U() As Double, V() As Double, M() As Double, D() As Double
+    Dim reactions() As Double, values() As Double
+    U = SolveFactored(F, nDOF)
+    CalculateForces U, nElems, elemLens, V, M, D, E_Val, I_Val, elemLoads
+    CalculateSupportReactions K_Global, U, F, supportDOFs, nSupports, nDOF, reactions
+    PackResponses V, M, D, reactions, values
+    ReconstructedUDLResponse = values(responseIndex)
+End Function
+
+Private Sub RemoveLegacyUDLTracer()
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("LL UDL Tracer")
+    On Error GoTo 0
+    If ws Is Nothing Then Exit Sub
+    Dim savedAlerts As Boolean, errorNumber As Long, errorDescription As String
+    savedAlerts = Application.DisplayAlerts
+    On Error GoTo DeleteFailed
+    Application.DisplayAlerts = False
+    ws.Delete
+    Application.DisplayAlerts = savedAlerts
+    Exit Sub
+DeleteFailed:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    Application.DisplayAlerts = savedAlerts
+    Err.Raise errorNumber, "RemoveLegacyUDLTracer", errorDescription
+End Sub
+
+Private Sub CreateUDLInfluenceChart(ws As Worksheet, nRows As Long, _
+                                    responseTitle As String, units As String, _
+                                    firstRow As Long)
+    Dim chObj As ChartObject, i As Long
+    Set chObj = ws.ChartObjects.Add( _
+        Left:=ws.Cells(firstRow, 13).Left + 20, Width:=650, _
+        Top:=ws.Rows(firstRow).Top + 20, Height:=320)
+    chObj.Name = "LLUDLInfluenceChart"
+    With chObj.Chart
+        .ChartType = xlXYScatterLinesNoMarkers
+        .HasTitle = True
+        .ChartTitle.Text = responseTitle & " - UDL Influence Zones"
+        For i = 1 To 3
+            .SeriesCollection.NewSeries
+            .SeriesCollection(i).XValues = ws.Range(ws.Cells(firstRow + 12, 8), ws.Cells(firstRow + 11 + nRows, 8))
+            .SeriesCollection(i).Values = ws.Range(ws.Cells(firstRow + 12, 8 + i), ws.Cells(firstRow + 11 + nRows, 8 + i))
+        Next i
+        .SeriesCollection(1).Name = "Influence line (one-sided at jumps)"
+        .SeriesCollection(2).Name = "Max UDL zones"
+        .SeriesCollection(3).Name = "Min UDL zones"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.Text = "Influence ordinate (" & units & "/kN)"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "Unit-load position (m)"
+    End With
+End Sub
+
+Sub OutputResults(loadCase As Long, xNodes() As Double, _
+                  xShear() As Double, _
+                  supportX() As Double, xTruckSteps() As Double, _
+                  nSupports As Long, _
+                  TrkMaxV() As Double, TrkMinV() As Double, _
+                  TrkMaxM() As Double, TrkMinM() As Double, _
+                  TrkMaxD() As Double, TrkMinD() As Double, _
+                  TrkMaxR() As Double, TrkMinR() As Double, _
+                  TrkSuppMaxR() As Double, TrkSuppMinR() As Double, _
+                  TrkSuppGovPos() As Double, _
+                  LneMaxV() As Double, LneMinV() As Double, _
+                  LneMaxM() As Double, LneMinM() As Double, _
+                  LneMaxD() As Double, LneMinD() As Double, _
+                  LneMaxR() As Double, LneMinR() As Double, _
+                  LneSuppMaxR() As Double, LneSuppMinR() As Double, _
+                  LneSuppGovPos() As Double, _
+                  EnvMaxV() As Double, EnvMinV() As Double, _
+                  EnvMaxM() As Double, EnvMinM() As Double, _
+                  EnvMaxD() As Double, EnvMinD() As Double, _
+                  EnvMaxR() As Double, EnvMinR() As Double, _
+                  EnvSuppMaxR() As Double, EnvSuppMinR() As Double, _
+                  EnvSuppGovPos() As Double, _
+                  DLA_Val As Double, isDlaOverridden As Boolean, _
+                  Optional DLA_Base As Double = 0#, _
+                  Optional DLA_Multiplier As Double = 1#)
+
+    Dim ws As Worksheet
+
+    ' Reuse LL Results so its position in the workbook does not change.
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets("LL Results")
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        ' Create the sheet after LL Input only if it does not exist.
+        Set ws = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets("LL Input"))
+        ws.Name = "LL Results"
+    Else
+        ' Remove old charts, then clear old values and cell formatting.
+        ws.ChartObjects.Delete
+        ws.Cells.UnMerge
+        ws.Cells.Clear
+    End If
+
+    Dim nextCol As Long, truckCol As Long, laneCol As Long, envelopeCol As Long
+    Dim chartLeft As Double, combined As Boolean
+    combined = loadCase <> 1 And loadCase <> 2
+    nextCol = 1
+    If loadCase = 1 Or combined Then
+        truckCol = nextCol
+        WriteResultBlock ws, truckCol, "Truck", _
+            xNodes, TrkMaxM, TrkMinM, TrkMaxD, TrkMinD, xShear, TrkMaxV, TrkMinV, _
+            supportX, TrkSuppMaxR, TrkSuppMinR, TrkSuppGovPos, xTruckSteps, TrkMaxR, TrkMinR, _
+            nSupports, nextCol, DLA_Val, isDlaOverridden, DLA_Base, DLA_Multiplier
+    End If
+    If loadCase = 2 Or combined Then
+        laneCol = nextCol
+        WriteResultBlock ws, laneCol, "Lane", _
+            xNodes, LneMaxM, LneMinM, LneMaxD, LneMinD, xShear, LneMaxV, LneMinV, _
+            supportX, LneSuppMaxR, LneSuppMinR, LneSuppGovPos, xTruckSteps, LneMaxR, LneMinR, _
+            nSupports, nextCol, 0#, False
+    End If
+    If combined Then
+        envelopeCol = nextCol
+        WriteResultBlock ws, envelopeCol, "Envelope", _
+            xNodes, EnvMaxM, EnvMinM, EnvMaxD, EnvMinD, xShear, EnvMaxV, EnvMinV, _
+            supportX, EnvSuppMaxR, EnvSuppMinR, EnvSuppGovPos, xTruckSteps, EnvMaxR, EnvMinR, _
+            nSupports, nextCol, DLA_Val, isDlaOverridden, DLA_Base, DLA_Multiplier
+    End If
+    ws.Columns.AutoFit
+    chartLeft = ws.Cells(1, nextCol).Left + 20
+    If truckCol > 0 Then
+        CreateResultCharts ws, "Truck", truckCol, nSupports, supportX, _
+            UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, chartLeft
+    End If
+    If laneCol > 0 Then
+        CreateResultCharts ws, "Lane", laneCol, nSupports, supportX, _
+            UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, chartLeft + IIf(combined, 630, 0)
+    End If
+    If envelopeCol > 0 Then
+        CreateResultCharts ws, "Envelope", envelopeCol, nSupports, supportX, _
+            UBound(xNodes) + 3, UBound(xShear) + 3, UBound(xTruckSteps) + 3, chartLeft + 1260
+    End If
+End Sub
+
 Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
-                     xNodes() As Double, Mmax() As Double, Mmin() As Double, _
+                     xNodes() As Double, _
+                     Mmax() As Double, Mmin() As Double, _
                      Dmax() As Double, Dmin() As Double, _
-                     xShear() As Double, Vmax() As Double, Vmin() As Double, _
-                     supportX() As Double, SuppMaxR() As Double, SuppMinR() As Double, SuppGovPos() As Double, _
-                     xTruck() As Double, MaxR() As Double, MinR() As Double, _
+                     xShear() As Double, _
+                     Vmax() As Double, Vmin() As Double, _
+                     supportX() As Double, _
+                     SuppMaxR() As Double, SuppMinR() As Double, _
+                     SuppGovPos() As Double, _
+                     xTruck() As Double, _
+                     MaxR() As Double, MinR() As Double, _
                      nSupports As Long, ByRef nextCol As Long, _
-                     DLA_Val As Double, isDlaOverridden As Boolean)
+                     DLA_Val As Double, isDlaOverridden As Boolean, _
+                     Optional DLA_Base As Double = 0#, _
+                     Optional DLA_Multiplier As Double = 1#)
+
     Dim i As Long, s As Long, p As Long
-    
-    ' 1. Nodal Results
+
+    ' Nodal results
     ws.Cells(1, col0).Value = UCase(label) & " - NODAL RESULTS"
     ws.Cells(1, col0).Font.Bold = True
-    ws.Cells(2, col0).Resize(1, 5).Value = Array("Dist (m)", "Mom Max", "Mom Min", "Def Max", "Def Min")
+
+    ws.Cells(2, col0).Resize(1, 5).Value = _
+        Array("Dist (m)", "Mom Max", "Mom Min", "Def Max", "Def Min")
     ws.Cells(2, col0).Resize(1, 5).Font.Bold = True
-    
-    Dim n As Long: n = UBound(xNodes)
+
+    Dim n As Long
+    n = UBound(xNodes)
+
     Dim data() As Variant
     ReDim data(n, 4)
+
     For i = 0 To n
         data(i, 0) = xNodes(i)
         data(i, 1) = Mmax(i)
@@ -1309,43 +3045,86 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
         data(i, 3) = Dmax(i)
         data(i, 4) = Dmin(i)
     Next i
+
     ws.Cells(3, col0).Resize(n + 1, 5).Value = data
     ws.Cells(3, col0).Resize(n + 1, 3).NumberFormat = "0.00"
     ws.Cells(3, col0 + 3).Resize(n + 1, 2).NumberFormat = "0.0000"
-    
-    ' 2. Stepped Shear Results
-    Dim colShear As Long: colShear = col0 + 6
-    ws.Cells(1, colShear).Value = UCase(label) & " - SHEAR RESULTS (STEPPED)"
+
+    ' Stepped shear results
+    Dim colShear As Long
+    colShear = col0 + 6
+
+    ws.Cells(1, colShear).Value = _
+        UCase(label) & " - SHEAR RESULTS (STEPPED)"
     ws.Cells(1, colShear).Font.Bold = True
-    ws.Cells(2, colShear).Resize(1, 3).Value = Array("Dist (m)", "Shear Max", "Shear Min")
+
+    ws.Cells(2, colShear).Resize(1, 3).Value = _
+        Array("Dist (m)", "Shear Max", "Shear Min")
     ws.Cells(2, colShear).Resize(1, 3).Font.Bold = True
-    
-    Dim nS As Long: nS = UBound(xShear)
+
+    Dim nS As Long
+    nS = UBound(xShear)
+
     Dim dataS() As Variant
     ReDim dataS(nS, 2)
+
     For i = 0 To nS
         dataS(i, 0) = xShear(i)
         dataS(i, 1) = Vmax(i)
         dataS(i, 2) = Vmin(i)
     Next i
+
     ws.Cells(3, colShear).Resize(nS + 1, 3).Value = dataS
     ws.Cells(3, colShear).Resize(nS + 1, 3).NumberFormat = "0.00"
-    
-    ' 3. Support Reactions Summary (app parity: show effective sweep step alongside DLA)
-    Dim colSupp As Long: colSupp = col0 + 10
+
+    ' Support reactions summary
+    Dim colSupp As Long
+    colSupp = col0 + 10
+
     Dim stepNote As String
+
     If Abs(EFF_TRUCK_INCREMENT - TRUCK_INCREMENT) > 0.0000001 Then
-        stepNote = "; step " & Format(EFF_TRUCK_INCREMENT, "0.000") & "m (auto-refined from " & Format(TRUCK_INCREMENT, "0.000") & "m)"
+        stepNote = "; step " & _
+                   Format(EFF_TRUCK_INCREMENT, "0.000") & _
+                   "m (auto-refined from " & _
+                   Format(TRUCK_INCREMENT, "0.000") & "m)"
     Else
-        stepNote = "; step " & Format(EFF_TRUCK_INCREMENT, "0.000") & "m"
+        stepNote = "; step " & _
+                   Format(EFF_TRUCK_INCREMENT, "0.000") & "m"
     End If
-    ws.Cells(1, colSupp).Value = UCase(label) & " - SUPPORT REACTIONS SUMMARY (DLA = " & Format(DLA_Val * 100, "0.0") & "%" & IIf(isDlaOverridden, " OVERRIDE", " AUTO") & stepNote & ")"
+
+    Dim dlaNote As String
+    If LCase$(label) = "lane" Then
+        dlaNote = "DLA = 0% (NO LANE DLA)"
+    ElseIf Not isDlaOverridden Then
+        dlaNote = "TRUCK DLA = AUTO PER PLACEMENT; " & _
+                  IIf(TRUCK_INFLUENCE_DEPENDENT, "SELECTED AXLES; ", "ALL AXLES ON BRIDGE; ") & _
+                  Format(40# * DLA_Multiplier, "0.00") & "%/" & _
+                  Format(30# * DLA_Multiplier, "0.00") & "%/" & _
+                  Format(25# * DLA_Multiplier, "0.00") & "% EFFECTIVE" & _
+                  "; multiplier " & Format(DLA_Multiplier, "0.########")
+    Else
+        dlaNote = "DLA = " & Format(DLA_Val * 100, "0.00") & "% EFFECTIVE" & _
+                  " OVERRIDE"
+        If DLA_Multiplier <> 1# Then
+            dlaNote = dlaNote & "; base " & Format(DLA_Base * 100, "0.00") & _
+                      "%; multiplier " & Format(DLA_Multiplier, "0.########")
+        End If
+    End If
+    ws.Cells(1, colSupp).Value = _
+        UCase(label) & " - SUPPORT REACTIONS SUMMARY (" & dlaNote & stepNote & ")" & _
+        IIf(TRUCK_INFLUENCE_DEPENDENT, "; influence-dependent, continuous truck search", "; All Points")
+
     ws.Cells(1, colSupp).Font.Bold = True
-    ws.Cells(2, colSupp).Resize(1, 5).Value = Array("Support", "Location (m)", "Max Reaction (kN)", "Min Reaction (kN)", "Gov Truck Pos (m)")
+
+    ws.Cells(2, colSupp).Resize(1, 5).Value = _
+        Array("Support", "Location (m)", "Max Reaction (kN)", _
+              "Min Reaction (kN)", "Gov Truck Pos (m)")
     ws.Cells(2, colSupp).Resize(1, 5).Font.Bold = True
-    
+
     Dim dataSupp() As Variant
     ReDim dataSupp(nSupports - 1, 4)
+
     For s = 0 To nSupports - 1
         dataSupp(s, 0) = "Support " & (s + 1)
         dataSupp(s, 1) = supportX(s)
@@ -1353,153 +3132,207 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
         dataSupp(s, 3) = SuppMinR(s)
         dataSupp(s, 4) = SuppGovPos(s)
     Next s
+
     ws.Cells(3, colSupp).Resize(nSupports, 5).Value = dataSupp
     ws.Cells(3, colSupp + 1).Resize(nSupports, 4).NumberFormat = "0.00"
-    
-    ' 4. Reaction Diagrams Data (vs Truck Position)
-    Dim colTruckPos As Long: colTruckPos = col0 + 16
-    ws.Cells(1, colTruckPos).Value = UCase(label) & " - REACTION DIAGRAMS (VS TRUCK POSITION)"
+
+    ' Reaction diagram data versus truck position
+    Dim colTruckPos As Long
+    colTruckPos = col0 + 16
+
+    ws.Cells(1, colTruckPos).Value = _
+        UCase(label) & " - REACTION DIAGRAMS (VS TRUCK POSITION)" & _
+        IIf(TRUCK_INFLUENCE_DEPENDENT, " - SAMPLED; SEE OPTIMIZED SUPPORT SUMMARY", "")
     ws.Cells(1, colTruckPos).Font.Bold = True
-    
-    Dim nColsR As Long: nColsR = 1 + 2 * nSupports
+
+    Dim nColsR As Long
+    nColsR = 1 + 2 * nSupports
+
     Dim headersR() As Variant
     ReDim headersR(nColsR - 1)
+
     headersR(0) = "Truck Pos (m)"
+
     For s = 0 To nSupports - 1
         headersR(1 + s * 2) = "Supp " & (s + 1) & " Max"
         headersR(1 + s * 2 + 1) = "Supp " & (s + 1) & " Min"
     Next s
+
     ws.Cells(2, colTruckPos).Resize(1, nColsR).Value = headersR
     ws.Cells(2, colTruckPos).Resize(1, nColsR).Font.Bold = True
-    
-    Dim nSteps As Long: nSteps = UBound(xTruck) + 1
+
+    Dim nSteps As Long
+    nSteps = UBound(xTruck) + 1
+
     Dim dataR() As Variant
     ReDim dataR(nSteps - 1, nColsR - 1)
+
     For p = 0 To nSteps - 1
         dataR(p, 0) = xTruck(p)
+
         For s = 0 To nSupports - 1
             dataR(p, 1 + s * 2) = MaxR(p, s)
             dataR(p, 1 + s * 2 + 1) = MinR(p, s)
         Next s
     Next p
+
     ws.Cells(3, colTruckPos).Resize(nSteps, nColsR).Value = dataR
     ws.Cells(3, colTruckPos).Resize(nSteps, nColsR).NumberFormat = "0.00"
-    
+
     nextCol = colTruckPos + nColsR + 1
 End Sub
 
-' Adds shear, moment, deflection, and individual support reaction diagram charts.
 Sub CreateResultCharts(ws As Worksheet, label As String, col0 As Long, _
                        nSupports As Long, supportX() As Double, _
-                       lastRowM As Long, lastRowV As Long, lastRowR As Long, _
-                       leftPos As Double)
-    
-    Dim colShearDist As Long: colShearDist = col0 + 6
-    Dim colShearMax As Long: colShearMax = col0 + 7
-    Dim colShearMin As Long: colShearMin = col0 + 8
-    
-    Dim colNodalDist As Long: colNodalDist = col0
-    Dim colMomMax As Long: colMomMax = col0 + 1
-    Dim colMomMin As Long: colMomMin = col0 + 2
-    Dim colDefMax As Long: colDefMax = col0 + 3
-    Dim colDefMin As Long: colDefMin = col0 + 4
-    
-    Dim colTruckPos As Long: colTruckPos = col0 + 16
-    
-    ' 1. Shear Envelope
-    CreateChart ws, label & " - Shear Envelope", colShearDist, colShearMax, colShearMin, _
-                lastRowV, leftPos, 50, "Shear (kN)", "Span Position (m)"
-    
-    ' 2. Moment Envelope
-    CreateChart ws, label & " - Moment Envelope", colNodalDist, colMomMax, colMomMin, _
-                lastRowM, leftPos, 300, "Moment (kNm)", "Span Position (m)"
-    
-    ' 3. Deflection Envelope
-    CreateChart ws, label & " - Deflection Envelope", colNodalDist, colDefMax, colDefMin, _
-                lastRowM, leftPos, 550, "Deflection (m)", "Span Position (m)"
-    
-    ' 4. Reaction Diagram for Every Support
+                       lastRowM As Long, lastRowV As Long, _
+                       lastRowR As Long, leftPos As Double)
+
+    Dim colShearDist As Long
+    Dim colShearMax As Long
+    Dim colShearMin As Long
+
+    colShearDist = col0 + 6
+    colShearMax = col0 + 7
+    colShearMin = col0 + 8
+
+    Dim colNodalDist As Long
+    Dim colMomMax As Long, colMomMin As Long
+    Dim colDefMax As Long, colDefMin As Long
+
+    colNodalDist = col0
+    colMomMax = col0 + 1
+    colMomMin = col0 + 2
+    colDefMax = col0 + 3
+    colDefMin = col0 + 4
+
+    Dim colTruckPos As Long
+    colTruckPos = col0 + 16
+
+    CreateChart ws, label & " - Shear Envelope", _
+                colShearDist, colShearMax, colShearMin, _
+                lastRowV, leftPos, 50, _
+                "Shear (kN)", "Span Position (m)"
+
+    CreateChart ws, label & " - Moment Envelope", _
+                colNodalDist, colMomMax, colMomMin, _
+                lastRowM, leftPos, 300, _
+                "Moment (kNm)", "Span Position (m)"
+
+    CreateChart ws, label & " - Deflection Envelope", _
+                colNodalDist, colDefMax, colDefMin, _
+                lastRowM, leftPos, 550, _
+                "Deflection (m)", "Span Position (m)"
+
+    If LCase$(label) = "truck" Then Exit Sub
+
     Dim s As Long
     Dim chartTop As Double
     chartTop = 800
-    
+
     For s = 0 To nSupports - 1
-        Dim sColMax As Long: sColMax = colTruckPos + 1 + s * 2
-        Dim sColMin As Long: sColMin = colTruckPos + 1 + s * 2 + 1
+        Dim sColMax As Long, sColMin As Long
         Dim sTitle As String
-        sTitle = label & " - Support " & (s + 1) & " (x=" & Format(supportX(s), "0.0") & "m) Reaction Diagram"
-        
+
+        sColMax = colTruckPos + 1 + s * 2
+        sColMin = colTruckPos + 1 + s * 2 + 1
+
+        sTitle = label & " - Support " & (s + 1) & _
+                 " (x=" & Format(supportX(s), "0.0") & _
+                 "m) Reaction Diagram"
+
         CreateChart ws, sTitle, colTruckPos, sColMax, sColMin, _
-                    lastRowR, leftPos, chartTop, "Reaction (kN)", "Truck Position (m)"
+                    lastRowR, leftPos, chartTop, _
+                    "Reaction (kN)", "Truck Position (m)"
+
         chartTop = chartTop + 250
     Next s
-    
-    ' 5. All Supports Reaction Diagram (Combined)
+
     If nSupports > 1 Then
-        CreateAllSupportsReactionChart ws, label & " - All Supports Reaction Diagram", _
-                                       colTruckPos, colTruckPos + 1, nSupports, supportX, _
-                                       lastRowR, leftPos, chartTop
+        CreateAllSupportsReactionChart ws, _
+            label & " - All Supports Reaction Diagram", _
+            colTruckPos, colTruckPos + 1, nSupports, supportX, _
+            lastRowR, leftPos, chartTop
     End If
 End Sub
 
-Sub CreateChart(ws As Worksheet, title As String, xCol As Long, y1Col As Long, y2Col As Long, _
-                lastRow As Long, leftPos As Double, topPos As Double, yAxisTitle As String, _
+Sub CreateChart(ws As Worksheet, title As String, _
+                xCol As Long, y1Col As Long, y2Col As Long, _
+                lastRow As Long, leftPos As Double, _
+                topPos As Double, yAxisTitle As String, _
                 Optional xAxisTitle As String = "Span Position (m)")
+
     Dim chObj As ChartObject
-    Set chObj = ws.ChartObjects.Add(Left:=leftPos, Width:=600, Top:=topPos, Height:=240)
-    
+
+    Set chObj = ws.ChartObjects.Add( _
+        Left:=leftPos, Width:=600, Top:=topPos, Height:=240)
+
     With chObj.Chart
         .ChartType = xlXYScatterLinesNoMarkers
         .HasTitle = True
         .ChartTitle.Text = title
-        
-        ' Max Series
+
         .SeriesCollection.NewSeries
         .SeriesCollection(1).Name = "Max"
-        .SeriesCollection(1).XValues = ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
-        .SeriesCollection(1).Values = ws.Range(ws.Cells(3, y1Col), ws.Cells(lastRow, y1Col))
+        .SeriesCollection(1).XValues = _
+            ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
+        .SeriesCollection(1).Values = _
+            ws.Range(ws.Cells(3, y1Col), ws.Cells(lastRow, y1Col))
         .SeriesCollection(1).Format.Line.Weight = 1.25
-        
-        ' Min Series
+
         .SeriesCollection.NewSeries
         .SeriesCollection(2).Name = "Min"
-        .SeriesCollection(2).XValues = ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
-        .SeriesCollection(2).Values = ws.Range(ws.Cells(3, y2Col), ws.Cells(lastRow, y2Col))
+        .SeriesCollection(2).XValues = _
+            ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
+        .SeriesCollection(2).Values = _
+            ws.Range(ws.Cells(3, y2Col), ws.Cells(lastRow, y2Col))
         .SeriesCollection(2).Format.Line.Weight = 1.25
-        
+
         .Axes(xlValue).HasTitle = True
         .Axes(xlValue).AxisTitle.Text = yAxisTitle
-        
+
         .Axes(xlCategory).HasTitle = True
         .Axes(xlCategory).AxisTitle.Text = xAxisTitle
     End With
 End Sub
 
-Sub CreateAllSupportsReactionChart(ws As Worksheet, title As String, xCol As Long, _
-                                   firstYCol As Long, nSupports As Long, supportX() As Double, _
-                                   lastRow As Long, leftPos As Double, topPos As Double)
+Sub CreateAllSupportsReactionChart( _
+    ws As Worksheet, title As String, xCol As Long, _
+    firstYCol As Long, nSupports As Long, _
+    supportX() As Double, lastRow As Long, _
+    leftPos As Double, topPos As Double)
+
     Dim chObj As ChartObject
     Dim s As Long
-    Set chObj = ws.ChartObjects.Add(Left:=leftPos, Width:=600, Top:=topPos, Height:=240)
-    
+
+    Set chObj = ws.ChartObjects.Add( _
+        Left:=leftPos, Width:=600, Top:=topPos, Height:=240)
+
     With chObj.Chart
         .ChartType = xlXYScatterLinesNoMarkers
         .HasTitle = True
         .ChartTitle.Text = title
-        
+
         For s = 0 To nSupports - 1
             .SeriesCollection.NewSeries
-            .SeriesCollection(s + 1).Name = "Support " & (s + 1) & " (x=" & Format(supportX(s), "0.0") & "m)"
-            .SeriesCollection(s + 1).XValues = ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
-            .SeriesCollection(s + 1).Values = ws.Range(ws.Cells(3, firstYCol + s * 2), ws.Cells(lastRow, firstYCol + s * 2))
+
+            .SeriesCollection(s + 1).Name = _
+                "Support " & (s + 1) & _
+                " (x=" & Format(supportX(s), "0.0") & "m)"
+
+            .SeriesCollection(s + 1).XValues = _
+                ws.Range(ws.Cells(3, xCol), ws.Cells(lastRow, xCol))
+
+            .SeriesCollection(s + 1).Values = _
+                ws.Range(ws.Cells(3, firstYCol + s * 2), _
+                         ws.Cells(lastRow, firstYCol + s * 2))
+
             .SeriesCollection(s + 1).Format.Line.Weight = 1.25
         Next s
-        
+
         .Axes(xlValue).HasTitle = True
         .Axes(xlValue).AxisTitle.Text = "Reaction (kN)"
-        
+
         .Axes(xlCategory).HasTitle = True
         .Axes(xlCategory).AxisTitle.Text = "Truck Position (m)"
     End With
 End Sub
-
