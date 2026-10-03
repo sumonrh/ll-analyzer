@@ -91,6 +91,22 @@ test('lane UDL agrees with exact simply supported solution; no DLA on lane truck
     close(a.reactions[0].max, 80 + 36);
 });
 
+test('lane UDL intensity is configurable and defaults to 9 kN/m', () => {
+    const spans = spansOf([8]);
+    const zero = axlesOf([[0, 0]]);
+    const nine = run(spans, zero, { loadCase: 'lane', nElemsPerSpan: 8 });
+    close(nine.moment[4].max, 9 * 8 ** 2 / 8);
+    close(nine.reactions[0].max, 9 * 8 / 2);
+    assert.equal(nine.config.laneUdl, 9);
+    const seven = run(spans, zero, { loadCase: 'lane', nElemsPerSpan: 8, laneUdl: 7 });
+    close(seven.moment[4].max, 7 * 8 ** 2 / 8);
+    close(seven.deflection[4].min, -5 * 7000 * 8 ** 4 / (384 * DEFAULT_CONFIG.E * DEFAULT_CONFIG.I), 1e-10);
+    close(seven.reactions[0].max, 7 * 8 / 2);
+    assert.equal(seven.config.laneUdl, 7);
+    const eight = run(spans, zero, { loadCase: 'lane', nElemsPerSpan: 8, laneUdl: 8 });
+    close(eight.moment[4].max, 8 * 8 ** 2 / 8);
+});
+
 test('DLA multiplier d scales uniform truck DLA; groups are 40/30/25%', () => {
     assert.equal(truckGroupDla(0, false), 0);
     assert.equal(truckGroupDla(1, false), 0.4);
@@ -231,7 +247,7 @@ test('coincident axles and loads exactly at supports retain equilibrium', () => 
 
 test('invalid input produces explicit errors before allocation or solving', () => {
     for (const config of [{ nElemsPerSpan: 2.5 }, { nElemsPerSpan: 1 }, { truckIncrement: 0 },
-        { E: NaN }, { I: -1 }, { dlaOverride: -0.1 }, { dlaMultiplier: -0.1 }, { dlaMultiplier: 1.5 }, { loadCase: 'invalid' }])
+        { E: NaN }, { I: -1 }, { dlaOverride: -0.1 }, { dlaMultiplier: -0.1 }, { dlaMultiplier: 1.5 }, { laneUdl: -1 }, { laneUdl: NaN }, { loadCase: 'invalid' }])
         assert.throws(() => run(DEFAULT_SPANS, DEFAULT_AXLES, config));
     assert.throws(() => run([], DEFAULT_AXLES), /span/);
     assert.throws(() => run(spansOf([0]), DEFAULT_AXLES), /Span 1/);

@@ -9,6 +9,7 @@ export type AnalysisConfig = {
     loadCase: LoadCase;
     dlaOverride?: number | null;
     dlaMultiplier?: number;
+    laneUdl?: number;
 };
 export type EnvelopePoint = { x: number; max: number; min: number };
 export type ReactionEnvelope = EnvelopePoint & { govPos: number };
@@ -57,7 +58,7 @@ export const DEFAULT_AXLES: Axle[] = [
 ];
 export const DEFAULT_CONFIG: AnalysisConfig = {
     E: 200000000000, I: 0.005, nElemsPerSpan: 40, truckIncrement: 0.25,
-    loadCase: 'truck', dlaOverride: null, dlaMultiplier: 1,
+    loadCase: 'truck', dlaOverride: null, dlaMultiplier: 1, laneUdl: 9,
 };
 export const MAX_PATTERN_SPANS = 12;
 export const MAX_AXLES = 20;
@@ -195,6 +196,9 @@ export function validateInputs({ spans, axles, config }: AnalysisRequest): void 
     const mult = config.dlaMultiplier ?? 1;
     if (!Number.isFinite(mult) || mult < 0 || mult > 1)
         throw new Error('Truck DLA multiplier (d) must be between 0 and 1.');
+    const laneUdl = config.laneUdl ?? LANE_UDL;
+    if (!Number.isFinite(laneUdl) || laneUdl < 0)
+        throw new Error('Lane UDL must be >= 0 kN/m.');
     const totalLength = spans.reduce((sum, s) => sum + s.length, 0);
     const truckLength = axles.slice(0, -1).reduce((sum, a) => sum + a.spacing, 0);
     if (!Number.isFinite(totalLength + 2 * truckLength) || !Number.isFinite(config.E * config.I))
@@ -1382,7 +1386,8 @@ export function analyzeBeam(
         built.truck = { ...t, dlaAuto: dla.isAuto, dlaBase: uniformBase, dlaMultiplier: dla.multiplier, dlaUsed: uniformEffective };
     }
     if (config.loadCase !== 'truck') {
-        const l = runCase('Lane', LANE_TRUCK_FACTOR, LANE_UDL, false, 1);
+        const wLane = config.laneUdl ?? LANE_UDL;
+        const l = runCase('Lane', LANE_TRUCK_FACTOR, wLane, false, 1);
         built.lane = { ...l, dlaAuto: false, dlaBase: 0, dlaMultiplier: 1, dlaUsed: 0 };
     }
 
@@ -1459,7 +1464,7 @@ export function analyzeBeam(
     if (built.lane) truckSolves += built.lane.truckSolves;
     return {
         ...selected, cases, loadCase: config.loadCase, spans: spans.map(s => ({ ...s })),
-        axles: axles.map(a => ({ ...a })), config: { ...config, dlaMultiplier: dla.multiplier },
+        axles: axles.map(a => ({ ...a })), config: { ...config, dlaMultiplier: dla.multiplier, laneUdl: config.laneUdl ?? LANE_UDL },
         xNodes: system.xNodes, supportPositions: system.supports, truckPositions: positions,
         incrementUsed: stepInfo.effective, baseIncrement: config.truckIncrement,
         incrementReason: stepInfo.reason, elapsedMs: performance.now() - started,

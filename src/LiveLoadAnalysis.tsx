@@ -419,55 +419,6 @@ const EnvelopeChart = ({
     );
 };
 
-const AllSupportsChart = ({ diagrams }: { diagrams: EnvelopePoint[][] }) => {
-    if (diagrams.length === 0 || diagrams[0].length === 0) return null;
-    const colors = ['#2563eb', '#059669', '#9333ea', '#ea580c', '#0891b2', '#be123c'];
-    const xMin = diagrams[0][0].x;
-    const xMax = diagrams[0][diagrams[0].length - 1].x;
-    let yMin = 0;
-    let yMax = 0;
-    for (const diagram of diagrams) {
-        for (const point of diagram) {
-            yMin = Math.min(yMin, point.max);
-            yMax = Math.max(yMax, point.max);
-        }
-    }
-    const margin = (yMax - yMin) * 0.1 || 1;
-    yMin -= margin;
-    yMax += margin;
-    const sx = (x: number) => 70 + (x - xMin) / (xMax - xMin) * 900;
-    const sy = (y: number) => 230 - (y - yMin) / (yMax - yMin) * 200;
-    return (
-        <div className="bg-white rounded-lg border border-gray-200 p-4 mb-6">
-            <h3 className="text-lg font-semibold">All Supports Reaction Diagram</h3>
-            <p className="text-xs text-gray-500">Maximum reaction at each truck position, enveloped over both travel directions.</p>
-            <svg viewBox="0 0 1000 285" className="w-full" role="img" aria-label="All supports reaction diagram">
-                {calculateTicks(yMin, yMax, 5).map(value => (
-                    <g key={value}>
-                        <line x1="70" x2="970" y1={sy(value)} y2={sy(value)} stroke="#e5e7eb" />
-                        <text x="60" y={sy(value) + 4} textAnchor="end" fontSize="12">{value}</text>
-                    </g>
-                ))}
-                {calculateTicks(xMin, xMax, 8).map(value => (
-                    <text key={value} x={sx(value)} y="250" textAnchor="middle" fontSize="12">{value}</text>
-                ))}
-                <line x1="70" x2="970" y1={sy(0)} y2={sy(0)} stroke="#9ca3af" />
-                {diagrams.map((diagram, s) => (
-                    <path key={s} d={diagram.map((p, i) => `${i ? 'L' : 'M'} ${sx(p.x)} ${sy(p.max)}`).join(' ')}
-                        fill="none" stroke={colors[s % colors.length]} strokeWidth="2">
-                        <title>Support {s + 1}</title>
-                    </path>
-                ))}
-                <text x="520" y="275" textAnchor="middle" fontSize="13">Truck lead position (m)</text>
-                <text x="15" y="135" transform="rotate(-90 15 135)" textAnchor="middle" fontSize="13">Reaction (kN)</text>
-            </svg>
-            <div className="flex flex-wrap gap-4 justify-center text-xs">
-                {diagrams.map((_, s) => <span key={s} style={{ color: colors[s % colors.length] }}>Support {s + 1}</span>)}
-            </div>
-        </div>
-    );
-};
-
 // Beam Schematic for Configuration View (shows beam with supports)
 const BeamSchematic = ({ spans }: { spans: Span[] }) => {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -895,6 +846,7 @@ export default function BeamAnalysisApp() {
             'Elastic Modulus (Pa)': results.config.E,
             'Moment of Inertia (m^4)': results.config.I,
             'DLA Multiplier d': results.config.dlaMultiplier ?? 1,
+            'Lane UDL (kN/m)': results.config.laneUdl ?? 9,
             'Method': 'FEA + influence-line UDL zones + continuous truck optimisation (VBA parity)',
             'Elapsed (ms)': results.elapsedMs,
         }]);
@@ -1039,9 +991,33 @@ export default function BeamAnalysisApp() {
                                                     className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
                                                 >
                                                     <option value="truck" > CL-625 Truck Only (Standard) </option>
-                                                    <option value="lane" > CL-625 Lane Load (80% Truck, no DLA + 9 kN/m patterned) </option>
+                                                    <option value="lane" >{`CL-625 Lane Load (80% Truck, no DLA + ${(config.laneUdl ?? 9)} kN/m patterned)`}</option>
                                                     <option value="envelope" > Envelope (max of Truck and Lane) </option>
                                                 </select>
+                                            </div>
+
+                                            <div>
+                                                <label className="block text-sm font-medium text-gray-700 mb-1" > Lane UDL (kN/m) </label>
+                                                <div className="flex items-center gap-2">
+                                                    <input
+                                                        type="number"
+                                                        step="0.5"
+                                                        min="0"
+                                                        value={config.laneUdl ?? 9}
+                                                        onChange={(e) => {
+                                                            const val = parseFloat(e.target.value);
+                                                            setConfig({
+                                                                ...config,
+                                                                laneUdl: isNaN(val) ? 9 : Math.max(0, val),
+                                                            });
+                                                        }}
+                                                        className="w-1/3 bg-white border border-gray-300 rounded px-2.5 py-1 text-sm focus:ring-2 focus:ring-blue-500 outline-none font-semibold"
+                                                        placeholder="e.g. 9"
+                                                    />
+                                                    <span className="text-xs text-gray-600">
+                                                        Default 9 kN/m (CL-625); use 7 or 8 for evaluation. Applies to Lane and Envelope cases.
+                                                    </span>
+                                                </div>
                                             </div>
 
                                             <div>
@@ -1313,17 +1289,6 @@ export default function BeamAnalysisApp() {
                                     ))}</tbody>
                                 </table>
                             </div>
-                            <AllSupportsChart diagrams={displayed.reactionDiagrams} />
-                            {displayed.reactionDiagrams.map((diagram, s) => (
-                                <details key={`${resultCase}-${s}`} className="mb-3">
-                                    <summary className="cursor-pointer font-medium text-sm p-3 bg-white rounded border border-gray-200">
-                                        Support {s + 1} (x = {results.supportPositions[s].toFixed(2)}m) reaction diagram
-                                    </summary>
-                                    <EnvelopeChart data={diagram} dataKeyMax="max" dataKeyMin="min"
-                                        title={`Support ${s + 1} Reaction vs Truck Position`} unit="Reaction (kN)"
-                                        color="#2563eb" xAxisTitle="Truck lead position (m)" />
-                                </details>
-                            ))}
 
                             <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200 mt-6" >
                                 <h3 className="font-semibold mb-4" > Export Data </h3>
