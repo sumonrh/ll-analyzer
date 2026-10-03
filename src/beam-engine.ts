@@ -1181,147 +1181,6 @@ function runInfluenceTruckEnvelope(
     return { maxima, minima, histMax, histMin, optMax, optMin, optGov, truckSolves };
 }
 
-export function debugTruckBest(
-    spans: Span[], axles: Axle[], config: AnalysisConfig, responseX: number, kind: 'moment' | 'shear' | 'deflection' | 'reaction' = 'moment'
-): { response: number; x: number; bestMax: number; govLeadMax: number; maskMax: number; baseMax: number; bestMin: number; govLeadMin: number; maskMin: number; baseMin: number } {
-    validateInputs({ spans, axles, config });
-    const dla = resolveDla(config);
-    const system = new BeamSystem(spans, config);
-    const nElems = system.nElems;
-    const nResponses = system.response.length;
-    const { coeffs } = buildInfluenceCache(system);
-    const nodes = system.xNodes;
-    let response = -1;
-    let x = responseX;
-    if (kind === 'moment') {
-        let bi = 0;
-        nodes.forEach((nx, i) => {
-            const dcur = Math.abs(nx - responseX);
-            const dbest = Math.abs(nodes[bi] - responseX);
-            if (dcur < dbest || (dcur === dbest && i > bi)) bi = i;
-        });
-        x = nodes[bi];
-        response = 2 * nElems + bi;
-    } else if (kind === 'deflection') {
-        let bi = 0;
-        nodes.forEach((nx, i) => { if (Math.abs(nx - responseX) < Math.abs(nodes[bi] - responseX)) bi = i; });
-        x = nodes[bi];
-        response = 3 * nElems + 1 + bi;
-    } else if (kind === 'shear') {
-        let bi = 0;
-        system.xShear.forEach((sx, i) => { if (Math.abs(sx - responseX) < Math.abs(system.xShear[bi] - responseX)) bi = i; });
-        x = system.xShear[bi];
-        response = bi;
-    } else {
-        let bi = 0;
-        system.supports.forEach((sx, i) => { if (Math.abs(sx - responseX) < Math.abs(system.supports[bi] - responseX)) bi = i; });
-        x = system.supports[bi];
-        response = 4 * nElems + 2 + bi;
-    }
-    const baseAxles = axles.map(a => a.load);
-    const spacings = axles.map(a => a.spacing);
-    const nAxles = axles.length;
-    const forwardWeights = [...baseAxles];
-    const forwardOffsets = new Array(nAxles).fill(0);
-    for (let i = 1; i < nAxles; i++) forwardOffsets[i] = forwardOffsets[i - 1] + spacings[i - 1];
-    const reverseWeights = [...baseAxles].reverse();
-    const reverseOffsets = new Array(nAxles).fill(0);
-    for (let i = 1; i < nAxles; i++) reverseOffsets[i] = reverseOffsets[i - 1] + spacings[nAxles - 1 - i];
-    const forwardGeometry = buildTruckGeometry(nodes, forwardOffsets, nAxles);
-    const reverseGeometry = buildTruckGeometry(nodes, reverseOffsets, nAxles);
-    const { knots, responseCoeffs } = prepareTruckResponse(response, nodes, coeffs, nElems, nResponses);
-    const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
-    const best = [0, 0];
-    const govLead = [0, 0];
-    const govMask = new Int32Array(2);
-    const govBase = [0, 0];
-    const govSide = new Int32Array(2);
-    truckResponseExtrema(response, forwardWeights, forwardOffsets, nAxles, nodes, knots, responseCoeffs,
-        forwardGeometry, dla.isAuto, dla.multiplier, axleFactor, false, best, govLead, govMask, govBase, govSide,
-        coeffs, nResponses, nElems);
-    truckResponseExtrema(response, reverseWeights, reverseOffsets, nAxles, nodes, knots, responseCoeffs,
-        reverseGeometry, dla.isAuto, dla.multiplier, axleFactor, true, best, govLead, govMask, govBase, govSide,
-        coeffs, nResponses, nElems);
-    return {
-        response, x, bestMax: best[0], govLeadMax: govLead[0], maskMax: govMask[0], baseMax: govBase[0],
-        bestMin: best[1], govLeadMin: govLead[1], maskMin: govMask[1], baseMin: govBase[1],
-    };
-}
-
-export function debugPointSweep(
-    spans: Span[], axles: Axle[], config: AnalysisConfig, responseX: number, step = 0.05
-): { x: number; continuousMax: number; densePointMax: number; denseLead: number; denseMask: number; denseBase: number } {
-    validateInputs({ spans, axles, config });
-    const dla = resolveDla(config);
-    const system = new BeamSystem(spans, config);
-    const nElems = system.nElems;
-    const nResponses = system.response.length;
-    const { coeffs } = buildInfluenceCache(system);
-    const nodes = system.xNodes;
-    let bi = 0;
-    nodes.forEach((nx, i) => {
-        const dcur = Math.abs(nx - responseX);
-        const dbest = Math.abs(nodes[bi] - responseX);
-        if (dcur < dbest || (dcur === dbest && i > bi)) bi = i;
-    });
-    const x = nodes[bi];
-    const response = 2 * nElems + bi;
-    const baseAxles = axles.map(a => a.load);
-    const spacings = axles.map(a => a.spacing);
-    const nAxles = axles.length;
-    const totalLength = nodes[nodes.length - 1];
-    const truckLength = spacings.slice(0, -1).reduce((s, v) => s + v, 0);
-    const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
-    const emptyGeometry: TruckGeometry = {
-        positions: [], midElement: new Int32Array(0), pointElement: new Int32Array(0),
-        z: new Float64Array(0), delta: new Float64Array(0), pointXi: new Float64Array(0), intervals: 0,
-    };
-    const cont = debugTruckBest(spans, axles, config, responseX, 'moment');
-    let densePointMax = -Infinity;
-    let denseLead = 0;
-    let denseMask = 0;
-    let denseBase = 0;
-    const dirs = [
-        { w: [...baseAxles], o: forwardOffsetsFor(spacings, nAxles), rev: false },
-        { w: [...baseAxles].reverse(), o: forwardOffsetsFor([...spacings].reverse(), nAxles), rev: true },
-    ];
-    // Note: reverse offsets need reversed spacings in reverse order; recompute properly below.
-    const fwdOffsets = new Array(nAxles).fill(0);
-    for (let i = 1; i < nAxles; i++) fwdOffsets[i] = fwdOffsets[i - 1] + spacings[i - 1];
-    const revSpacings = [...spacings.slice(0, -1)].reverse();
-    const revOffsets = new Array(nAxles).fill(0);
-    for (let i = 1; i < nAxles; i++) revOffsets[i] = revOffsets[i - 1] + (revSpacings[i - 1] ?? 0);
-    const revWeights = [...baseAxles].reverse();
-    for (let lead = -truckLength; lead <= totalLength + truckLength + 1e-9; lead += step) {
-        for (const [weights, offsets, isReverse] of [[forwardWeightsSafe(baseAxles), fwdOffsets, false], [revWeights, revOffsets, true]] as const) {
-            const cursor = new Int32Array(nAxles);
-            const { poly, masks, bases } = truckPolynomialPair(
-                response, lead, lead, 0, weights as unknown as ArrayLike<number>, offsets as unknown as ArrayLike<number>,
-                nAxles, nodes, coeffs, nResponses, nElems, dla.isAuto, dla.multiplier, axleFactor,
-                isReverse, cursor, null, true, false, false, emptyGeometry, -1
-            );
-            if (poly[0] > densePointMax) {
-                densePointMax = poly[0];
-                denseLead = lead;
-                denseMask = masks[0];
-                denseBase = bases[0];
-            }
-        }
-    }
-    void dirs;
-    return { x, continuousMax: cont.bestMax, densePointMax, denseLead, denseMask, denseBase };
-}
-
-function forwardOffsetsFor(spacings: number[], nAxles: number): number[] {
-    const o = new Array(nAxles).fill(0);
-    for (let i = 1; i < nAxles; i++) o[i] = o[i - 1] + (spacings[i - 1] ?? 0);
-    return o;
-}
-
-function forwardWeightsSafe(baseAxles: number[]): number[] {
-    return [...baseAxles];
-}
-
 export function analyzeBeam(
     request: AnalysisRequest, onProgress?: (progress: AnalysisProgress) => void
 ): AnalysisResults {
@@ -1373,17 +1232,9 @@ export function analyzeBeam(
     const progressShim = (f: number, m: string) => onProgress?.({ fraction: f, message: m });
     void progressShim;
     if (config.loadCase !== 'lane') {
-        // Uniform DLA (span-based auto × d, or override × d) applied to the
-        // whole truck: keeps the envelope smooth. Selected-axle
-        // placement-dependent DLA creates knife-edge jumps (an axle exactly at
-        // a support/root flips 40%↔30% on ~zero contribution), verified by
-        // dense point sweeps. Statics stay continuous-optimised + influence UDL.
-        const spanDla = computeAutoDlaInfo(spans, axles).dla;
-        const uniformBase = dla.isAuto ? spanDla : dla.base;
-        const uniformEffective = uniformBase * dla.multiplier;
-        const axleFactor = 1 + uniformEffective;
-        const t = runCase('Truck', axleFactor, 0, false, dla.multiplier);
-        built.truck = { ...t, dlaAuto: dla.isAuto, dlaBase: uniformBase, dlaMultiplier: dla.multiplier, dlaUsed: uniformEffective };
+        const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
+        const t = runCase('Truck', axleFactor, 0, dla.isAuto, dla.multiplier);
+        built.truck = { ...t, dlaAuto: dla.isAuto, dlaBase: dla.isAuto ? 0 : dla.base, dlaMultiplier: dla.multiplier, dlaUsed: dla.isAuto ? 0 : dla.effective };
     }
     if (config.loadCase !== 'truck') {
         const wLane = config.laneUdl ?? LANE_UDL;

@@ -1049,7 +1049,7 @@ export default function BeamAnalysisApp() {
                                                                 Auto: 40%/30%/25% × d={(config.dlaMultiplier ?? 1).toFixed(2)}
                                                             </span>
                                                             <span className="text-xs text-slate-600">
-                                                                Span-based uniform ({autoDlaInfo.desc})
+                                                                Selected axles per placement ({autoDlaInfo.desc})
                                                             </span>
                                                         </div>
                                                         <span className="text-[10px] text-slate-400 font-medium">CSA S6 Cl. 3.8.4.5</span>
@@ -1081,7 +1081,7 @@ export default function BeamAnalysisApp() {
                                                 )}
                                                 <span className="text-[11px] text-gray-500 mt-1 block">
                                                     Automated per CSA S6 Cl. 3.8.4.5 with FEA + influence-line placement (verified vs Midas Civil).
-                                                    Uniform span-based DLA: 40% (1 axle), 30% (2 axles / tandem), 25% (≥3 axles), × d multiplier.
+                                                    Selected-axle DLA per placement: 40% (1 axle), 30% (2 axles / front-three), 25% (≥3 axles), × d multiplier.
                                                     Lane UDL (9 kN/m) uses exact positive/negative influence zones incl. partial elements, no DLA; lane truck uses 80% with no DLA.
                                                 </span>
                                                 <div className="mt-2">
@@ -1234,7 +1234,7 @@ export default function BeamAnalysisApp() {
                                         : <> (base setting)</>}.
                                     Exact axle/support alignment positions included. Envelopes use continuous truck optimisation; UDL uses exact influence zones.
                                     {displayed.dlaAuto
-                                        ? <> Truck DLA auto (span-based uniform): 40%/30%/25% × d={(displayed.dlaMultiplier ?? 1).toFixed(2)}.</>
+                                        ? <> Truck DLA auto: 40%/30%/25% × d={(displayed.dlaMultiplier ?? 1).toFixed(2)} per selected-axle placement.</>
                                         : <> Truck DLA effective: {((displayed.dlaUsed ?? 0) * 100).toFixed(2)}%{resultCase !== 'lane' ? ` (base ${((displayed.dlaBase ?? 0) * 100).toFixed(2)}% × d=${(displayed.dlaMultiplier ?? 1).toFixed(2)})` : ' (lane: no DLA)' }.</>}
                                 </div>
                             )}

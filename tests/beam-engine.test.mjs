@@ -107,7 +107,7 @@ test('lane UDL intensity is configurable and defaults to 9 kN/m', () => {
     close(eight.moment[4].max, 8 * 8 ** 2 / 8);
 });
 
-test('DLA multiplier d scales uniform truck DLA; groups are 40/30/25%', () => {
+test('DLA multiplier d scales truck DLA; auto uses selected-axle 40/30/25% groups', () => {
     assert.equal(truckGroupDla(0, false), 0);
     assert.equal(truckGroupDla(1, false), 0.4);
     assert.equal(truckGroupDla(2, false), 0.3);
