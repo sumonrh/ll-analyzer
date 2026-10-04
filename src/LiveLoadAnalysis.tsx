@@ -3,7 +3,7 @@ import { Play, RotateCcw, Plus, Trash2, Settings, AlertCircle, Download } from '
 import AnalysisWorker from './analysis.worker?worker&inline';
 import {
     DEFAULT_SPANS, DEFAULT_AXLES, DEFAULT_CONFIG, MAX_AXLES,
-    computeAutoDlaInfo, computeEffectiveIncrement,
+    computeEffectiveIncrement,
 } from './beam-engine';
 import type {
     Span, Axle, AnalysisConfig, AnalysisResults, AnalysisResponse,
@@ -738,7 +738,6 @@ export default function BeamAnalysisApp() {
 
     useEffect(() => () => workerRef.current?.terminate(), []);
 
-    const autoDlaInfo = useMemo(() => computeAutoDlaInfo(spans, axles), [spans, axles]);
     const stepInfo = useMemo(
         () => computeEffectiveIncrement(spans, axles, config.truckIncrement, config.nElemsPerSpan),
         [spans, axles, config.truckIncrement, config.nElemsPerSpan]
@@ -876,6 +875,29 @@ export default function BeamAnalysisApp() {
                 return row;
             }));
         }
+        const tracer = results.udlTracer;
+        if (tracer) {
+            append('UDL Tracer', [{
+                'Response': `Moment at node ${tracer.nodeIndex}`,
+                'Location (m)': tracer.x, 'UDL (kN/m)': tracer.intensity,
+                'UDL Max (kNm)': tracer.max, 'UDL Min (kNm)': tracer.min,
+                'Reconstructed Max (kNm)': tracer.reconstructedMax,
+                'Reconstructed Min (kNm)': tracer.reconstructedMin,
+                'Verification Tolerance (kNm)': tracer.tolerance,
+                'Selection': 'Node nearest bridge midpoint, not the governing maximum',
+                'Scope': 'UDL only; each response has its own loading. UDL overlaps the lane truck.',
+            }]);
+            append('UDL Intervals', tracer.intervals.map(interval => ({
+                'Envelope': interval.envelope, 'Element': interval.element,
+                'Start (m)': interval.start, 'End (m)': interval.end,
+                'Length (m)': interval.end - interval.start,
+                'Contribution (kNm)': interval.contribution,
+            })));
+            append('UDL Influence', tracer.influenceLine.map(point => ({
+                'Load Position (m)': point.x, 'Influence Ordinate (kNm/kN)': point.ordinate,
+                'Max UDL Zones': point.max, 'Min UDL Zones': point.min,
+            })));
+        }
         try {
             xlsx.writeFile(wb, 'beam_analysis_results.xlsx');
         } catch (error) {
@@ -991,7 +1013,7 @@ export default function BeamAnalysisApp() {
                                                     className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
                                                 >
                                                     <option value="truck" > CL-625 Truck Only (Standard) </option>
-                                                    <option value="lane" >{`CL-625 Lane Load (80% Truck, no DLA + ${(config.laneUdl ?? 9)} kN/m patterned)`}</option>
+                                                    <option value="lane" >{`CL-625 Lane Load (80% Truck, no DLA + ${(config.laneUdl ?? 9)} kN/m influence zones)`}</option>
                                                     <option value="envelope" > Envelope (max of Truck and Lane) </option>
                                                 </select>
                                             </div>
@@ -1003,19 +1025,18 @@ export default function BeamAnalysisApp() {
                                                         type="number"
                                                         step="0.5"
                                                         min="0"
-                                                        value={config.laneUdl ?? 9}
+                                                        value={config.laneUdl ?? ''}
                                                         onChange={(e) => {
-                                                            const val = parseFloat(e.target.value);
                                                             setConfig({
                                                                 ...config,
-                                                                laneUdl: isNaN(val) ? 9 : Math.max(0, val),
+                                                                laneUdl: e.target.value === '' ? null : e.target.valueAsNumber,
                                                             });
                                                         }}
                                                         className="w-1/3 bg-white border border-gray-300 rounded px-2.5 py-1 text-sm focus:ring-2 focus:ring-blue-500 outline-none font-semibold"
-                                                        placeholder="e.g. 9"
+                                                        placeholder="9 (default)"
                                                     />
                                                     <span className="text-xs text-gray-600">
-                                                        Default 9 kN/m (CL-625); use 7 or 8 for evaluation. Applies to Lane and Envelope cases.
+                                                        Blank = 9 kN/m (CL-625). Zero removes only the UDL; the 80% lane truck remains. Applies to Lane and Envelope cases.
                                                     </span>
                                                 </div>
                                             </div>
@@ -1033,7 +1054,7 @@ export default function BeamAnalysisApp() {
                                                                 const checked = e.target.checked;
                                                                 setConfig({
                                                                     ...config,
-                                                                    dlaOverride: checked ? (config.dlaOverride ?? autoDlaInfo.dla) : null,
+                                                                    dlaOverride: checked ? (config.dlaOverride ?? 0.25) : null,
                                                                 });
                                                             }}
                                                             className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 h-3.5 w-3.5 cursor-pointer"
@@ -1049,7 +1070,7 @@ export default function BeamAnalysisApp() {
                                                                 Auto: 40%/30%/25% × d={(config.dlaMultiplier ?? 1).toFixed(2)}
                                                             </span>
                                                             <span className="text-xs text-slate-600">
-                                                                Selected axles per placement ({autoDlaInfo.desc})
+                                                                By response sign and selected axle group
                                                             </span>
                                                         </div>
                                                         <span className="text-[10px] text-slate-400 font-medium">CSA S6 Cl. 3.8.4.5</span>
@@ -1080,9 +1101,9 @@ export default function BeamAnalysisApp() {
                                                     </div>
                                                 )}
                                                 <span className="text-[11px] text-gray-500 mt-1 block">
-                                                    Automated per CSA S6 Cl. 3.8.4.5 with FEA + influence-line placement (verified vs Midas Civil).
+                                                    FEA + influence-line placement follows the supplied VBA load rules; exact MIDAS Civil agreement requires a matching benchmark.
                                                     Selected-axle DLA per placement: 40% (1 axle), 30% (2 axles / front-three), 25% (≥3 axles), × d multiplier.
-                                                    Lane UDL (9 kN/m) uses exact positive/negative influence zones incl. partial elements, no DLA; lane truck uses 80% with no DLA.
+                                                    Lane UDL uses the configured intensity on exact positive/negative influence zones including partial elements, no DLA; lane truck uses 80% with no DLA.
                                                 </span>
                                                 <div className="mt-2">
                                                     <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -1223,7 +1244,7 @@ export default function BeamAnalysisApp() {
                                     </select>
                                 </label>
                                 <span className="text-xs text-gray-500">
-                                    {results.elapsedMs.toFixed(0)}ms | {results.stats.truckSolves} truck positions | {results.stats.udlSolves} span UDL solves
+                                    {results.elapsedMs.toFixed(0)}ms | {results.stats.influenceSolves} unit-load solves | {results.stats.udlIntegrations} UDL influence integrations
                                 </span>
                             </div>
                             {results.incrementUsed !== undefined && (
@@ -1236,6 +1257,7 @@ export default function BeamAnalysisApp() {
                                     {displayed.dlaAuto
                                         ? <> Truck DLA auto: 40%/30%/25% × d={(displayed.dlaMultiplier ?? 1).toFixed(2)} per selected-axle placement.</>
                                         : <> Truck DLA effective: {((displayed.dlaUsed ?? 0) * 100).toFixed(2)}%{resultCase !== 'lane' ? ` (base ${((displayed.dlaBase ?? 0) * 100).toFixed(2)}% × d=${(displayed.dlaMultiplier ?? 1).toFixed(2)})` : ' (lane: no DLA)' }.</>}
+                                    {resultCase !== 'truck' && <> Lane: 80% truck + {results.config.laneUdl} kN/m influence-zone UDL; neither receives DLA.</>}
                                 </div>
                             )}
                             <BeamReactionDiagram
@@ -1275,6 +1297,7 @@ export default function BeamAnalysisApp() {
                             />
                             <div className="bg-white rounded-lg border border-gray-200 p-4 mb-6 overflow-x-auto">
                                 <h3 className="text-lg font-semibold mb-3">Support Reaction Summary</h3>
+                                <p className="text-xs text-gray-600 mb-3">Both maximum and minimum reactions use continuous truck optimization, not sampled reaction histories.</p>
                                 <table className="w-full text-sm text-right">
                                     <thead><tr className="border-b">
                                         <th className="text-left">Support</th><th>Location (m)</th>
@@ -1290,10 +1313,61 @@ export default function BeamAnalysisApp() {
                                 </table>
                             </div>
 
+                            {results.udlTracer && resultCase !== 'truck' && (
+                                <section aria-label="Lane UDL tracer">
+                                    <div className="bg-white rounded-lg border border-gray-200 p-4 mb-4">
+                                        <h3 className="text-lg font-semibold mb-2">Lane UDL Tracer - Influence-Zone Loading</h3>
+                                        <p className="text-sm text-gray-600">
+                                            Moment at x={results.udlTracer.x.toFixed(3)}m (node {results.udlTracer.nodeIndex}).
+                                            Automatically selected nearest the bridge midpoint, not the governing maximum.
+                                            Each response has its own favorable loading; UDL may overlap the lane truck.
+                                        </p>
+                                        <p className="text-sm my-2">
+                                            UDL only: {results.udlTracer.intensity} kN/m;
+                                            max {results.udlTracer.max.toPrecision(8)} kNm;
+                                            min {results.udlTracer.min.toPrecision(8)} kNm.
+                                        </p>
+                                        <p className="text-xs text-green-800">
+                                            Partial-UDL FEM verification passed:
+                                            reconstructed max {results.udlTracer.reconstructedMax.toPrecision(8)} kNm,
+                                            min {results.udlTracer.reconstructedMin.toPrecision(8)} kNm;
+                                            absolute tolerance {results.udlTracer.tolerance.toExponential(3)} kNm.
+                                        </p>
+                                        {results.udlTracer.intensity === 0 && (
+                                            <p className="text-sm text-blue-800 mt-2">UDL is off. Unit influence zones remain visible; UDL demand is zero. The lane truck is unchanged.</p>
+                                        )}
+                                        <details className="mt-3 overflow-x-auto">
+                                            <summary className="cursor-pointer text-sm font-medium">Favorable UDL intervals ({results.udlTracer.intervals.length})</summary>
+                                            {results.udlTracer.intervals.length === 0 ? (
+                                                <p className="text-sm mt-2">No nonzero favorable UDL intervals.</p>
+                                            ) : (
+                                                <table className="w-full text-sm text-right mt-2">
+                                                    <thead><tr className="border-b"><th>Envelope</th><th>Element</th><th>Start (m)</th><th>End (m)</th><th>Contribution (kNm)</th></tr></thead>
+                                                    <tbody>{results.udlTracer.intervals.map((interval, i) => (
+                                                        <tr key={i} className="border-b border-gray-100">
+                                                            <td>{interval.envelope}</td><td>{interval.element}</td>
+                                                            <td>{interval.start.toFixed(6)}</td><td>{interval.end.toFixed(6)}</td>
+                                                            <td>{interval.contribution.toPrecision(8)}</td>
+                                                        </tr>
+                                                    ))}</tbody>
+                                                </table>
+                                            )}
+                                        </details>
+                                    </div>
+                                    <EnvelopeChart
+                                        title="UDL Moment Influence Zones"
+                                        data={results.udlTracer.influenceLine}
+                                        dataKeyMax="max" dataKeyMin="min"
+                                        unit="Unit-load influence (kNm/kN)"
+                                        xAxisTitle="Load position (m)" color="#0891b2"
+                                    />
+                                </section>
+                            )}
+
                             <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200 mt-6" >
                                 <h3 className="font-semibold mb-4" > Export Data </h3>
                                 < div className="text-sm text-gray-600 mb-4" >
-                                    Download full-precision Excel results: settings, spans, axles, shear, moment, deflection, support summaries and reaction diagrams. Envelope mode includes Truck, Lane and Combined Envelope sheets.
+                                    Download full-precision Excel results: settings, spans, axles, shear, moment, deflection, support summaries and sampled reaction histories. Lane/Envelope analyses also include the UDL tracer, favorable intervals and unit influence zones. Envelope mode includes Truck, Lane and Combined Envelope sheets.
                                 </div>
                                 < button
                                     onClick={downloadExcel}

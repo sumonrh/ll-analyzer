@@ -1,6 +1,5 @@
-// Independent dense implementation of the VBA equations for regression testing.
-// Deliberately enumerates every UDL pattern and uses dense Doolittle LU.
-export function referenceAnalysis(spans, axles, config) {
+// Independent dense FEM implementation; the legacy sweep enumerates whole-span UDL patterns.
+function referenceSystem(spans, config) {
     const n = spans.length * config.nElemsPerSpan;
     const nd = 2 * (n + 1);
     const x = [0];
@@ -64,6 +63,36 @@ export function referenceAnalysis(spans, axles, config) {
     const loadArrays = () => ({
         F: Array(nd).fill(0), elemLoads: Array.from({ length: n }, () => [0, 0, 0, 0]),
     });
+    return { n, x, lengths, supports, solve, loadArrays };
+}
+
+export function referencePartialUdl(spans, config, intervals, intensity) {
+    const { n, x, lengths, solve, loadArrays } = referenceSystem(spans, config);
+    const { F, elemLoads } = loadArrays();
+    // Two-point Gauss quadrature integrates the cubic Hermite shapes exactly.
+    for (const interval of intervals) {
+        const e = interval.element - 1;
+        const le = lengths[e];
+        const a = (interval.start - x[e]) / le;
+        const b = (interval.end - x[e]) / le;
+        const half = (b - a) / 2;
+        for (const sign of [-1, 1]) {
+            const t = (a + b) / 2 + sign * half / Math.sqrt(3);
+            const shapes = [1 - 3 * t ** 2 + 2 * t ** 3, le * (t - 2 * t ** 2 + t ** 3),
+                3 * t ** 2 - 2 * t ** 3, le * (-(t ** 2) + t ** 3)];
+            for (let r = 0; r < 4; r++) {
+                const value = -intensity * 1000 * le * half * shapes[r];
+                F[e * 2 + r] += value;
+                elemLoads[e][r] += value;
+            }
+        }
+    }
+    const packed = solve(F, elemLoads);
+    return { moment: packed.slice(2 * n, 3 * n + 1) };
+}
+
+export function referenceAnalysis(spans, axles, config) {
+    const { n, x, lengths, supports, solve, loadArrays } = referenceSystem(spans, config);
     const truckResponse = (lead, direction) => {
         const { F, elemLoads } = loadArrays();
         let pos = lead;
@@ -96,8 +125,9 @@ export function referenceAnalysis(spans, axles, config) {
                 const s = Math.floor(e / config.nElemsPerSpan);
                 if ((pattern & (2 ** s)) === 0) continue;
                 const le = lengths[e];
-                const values = [-9 * le * 1000 / 2, -9 * le ** 2 * 1000 / 12,
-                    -9 * le * 1000 / 2, 9 * le ** 2 * 1000 / 12];
+                const w = config.laneUdl ?? 9;
+                const values = [-w * le * 1000 / 2, -w * le ** 2 * 1000 / 12,
+                    -w * le * 1000 / 2, w * le ** 2 * 1000 / 12];
                 for (let r = 0; r < 4; r++) {
                     F[e * 2 + r] += values[r];
                     elemLoads[e][r] += values[r];

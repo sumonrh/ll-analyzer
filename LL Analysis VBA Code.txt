@@ -60,7 +60,6 @@ Private m_TruckGovReverse() As Boolean
 Private m_TruckGovBase() As Double
 Private m_TruckGovValue() As Double
 Private m_TruckGovReady As Boolean
-Private m_LaneUDL As Double
 
 Private Type TruckGeometry
     positions() As Double
@@ -104,7 +103,6 @@ Sub CreateInputSheet()
     ws.Range("C10:C14").Value = Application.Transpose(Array(3.6, 1.2, 6.6, 6.6, 0))
     ws.Range(INPUT_ELEMENTS_CELL).Value = DEF_N_ELEMS_PER_SPAN
     ws.Range(INPUT_INCREMENT_CELL).Value = DEF_TRUCK_INCREMENT
-    ws.Range(INPUT_UDL_CELL).Value = LANE_UDL
     UpdateInputGuidance ws
 End Sub
 
@@ -130,29 +128,57 @@ Private Sub BuildInputLayout(ws As Worksheet)
     ws.Range("A34").Value = "DLA Override:"
     ws.Range("A35").Value = "Truck DLA Multiplier (0-1):"
     ws.Range("A36").Value = "Lane UDL (kN/m):"
-    ws.Range("A40:B40").Value = Array("Span", "Length (m)")
     Dim i As Long, heading As Variant
     For i = 0 To MAX_AXLES - 1
         ws.Cells(INPUT_AXLE_FIRST_ROW + i, 1).Value = i + 1
     Next i
-    For i = 0 To MAX_INPUT_SPANS - 1
-        ws.Cells(INPUT_SPAN_FIRST_ROW + i, 1).Value = "Span " & (i + 1)
-    Next i
-    For Each heading In Array(6, 31, 39)
+    For Each heading In Array(6, 31)
         ws.Range(ws.Cells(heading, 1), ws.Cells(heading, 4)).Merge
         ws.Cells(heading, 1).Font.Bold = True
         ws.Range(ws.Cells(heading, 1), ws.Cells(heading, 4)).Interior.Color = RGB(220, 220, 220)
     Next heading
     ws.Range("A6").Value = "LOAD CONFIGURATION"
     ws.Range("A31").Value = "ANALYSIS SETTINGS"
-    ws.Range("A39").Value = "SPAN LENGTHS (maximum 10)"
-    ws.Range("B3:B4,B7,B10:C29,B32:B36,B41:B50").Interior.Color = RGB(230, 240, 255)
-    ws.Range("A9:C29,A40:B50").Borders.LineStyle = xlContinuous
-    ws.Range("A9:C9,A40:B40").Font.Bold = True
+    ws.Range("B3:B4,B7,B10:C29,B32:B36").Interior.Color = RGB(230, 240, 255)
+    ws.Range("A9:C29").Borders.LineStyle = xlContinuous
+    ws.Range("A9:C9").Font.Bold = True
     ws.Range("A9:C9").WrapText = True
+    BuildSpanInputLayout ws
+End Sub
+
+Private Sub BuildSpanInputLayout(ws As Worksheet)
+    ws.Range("A39:D50").Font.Size = 10
+    ws.Range("A39:D39").Merge
+    ws.Range("A39").Value = "SPAN LENGTHS (maximum 10)"
+    ws.Range("A39").Font.Bold = True
+    ws.Range("A39:D39").Interior.Color = RGB(220, 220, 220)
+    ws.Range("A40:B40").Value = Array("Span", "Length (m)")
+    ws.Range("A40:B40").Font.Bold = True
+    Dim i As Long
+    For i = 0 To MAX_INPUT_SPANS - 1
+        ws.Cells(INPUT_SPAN_FIRST_ROW + i, 1).Value = "Span " & (i + 1)
+    Next i
+    ws.Range("B41:B50").Interior.Color = RGB(230, 240, 255)
+    ws.Range("A40:B50").Borders.LineStyle = xlContinuous
 End Sub
 
 Private Sub EnsureInputLayout(ws As Worksheet)
+    If CStr(ws.Range("A9").Value) = "Axle" Then
+        Dim savedInputs As Variant
+        If CStr(ws.Range("A38").Value) = "Span" Then
+            savedInputs = ws.Range("B39:B48").Formula
+            ws.Range("A37:D50").UnMerge
+            ws.Range("A37:D50").Clear
+            BuildSpanInputLayout ws
+            ws.Range("B41:B50").Formula = savedInputs
+        ElseIf CStr(ws.Range("A36").Value) = "UDL Tracer Response:" And _
+               CStr(ws.Range("A40").Value) = "Span" Then
+            savedInputs = ws.Range("B38").Formula
+            ws.Range("A36:D38").UnMerge
+            ws.Range("A36:D38").Clear
+            ws.Range(INPUT_UDL_CELL).Formula = savedInputs
+        End If
+    End If
     If CStr(ws.Range("A9").Value) <> "Axle" Or _
        CStr(ws.Range("A40").Value) <> "Span" Then
         If CStr(ws.Range("G1").Value) <> "ANALYSIS SETTINGS" Then
@@ -194,7 +220,6 @@ Private Sub UpdateInputGuidance(ws As Worksheet)
     ws.Rows(7).RowHeight = 25
     ws.Rows(9).RowHeight = 27
     ws.Rows("34:36").RowHeight = 26
-    ws.Rows("37:38").RowHeight = 21
     ws.Range("B2").Formula = "=COUNT(B" & INPUT_SPAN_FIRST_ROW & ":B" & _
                              (INPUT_SPAN_FIRST_ROW + MAX_INPUT_SPANS - 1) & ")"
     ws.Range("B2").Calculate
@@ -210,24 +235,10 @@ Private Sub UpdateInputGuidance(ws As Worksheet)
         .ErrorMessage = "Enter a number from 0 to 1. Blank means 1 (no reduction)."
         .ShowError = True
     End With
-    ' Retired cells: tracer inputs (former B36/B37) removed; UDL moved B38 -> B36.
-    ' Carry an existing B38 value forward so custom 7/8 kN/m entries survive.
     ws.Range("A36").Value = "Lane UDL (kN/m):"
-    ws.Range("A37:A38").ClearContents
-    Dim retiredUdl As Variant
-    retiredUdl = ws.Range("B38").Value
-    If IsError(ws.Range("B36").Value) Or Not IsNumeric(ws.Range("B36").Value) Then
-        If Not IsError(retiredUdl) Then
-            If IsNumeric(retiredUdl) Then ws.Range("B36").Value = CDbl(retiredUdl)
-        End If
-        If IsError(ws.Range("B36").Value) Or Not IsNumeric(ws.Range("B36").Value) Then _
-            ws.Range("B36").Value = Empty
-    End If
-    ws.Range("B37:B38").ClearContents
-    ws.Range("C37:D38").UnMerge
-    ws.Range("C37:D38").ClearContents
     If IsEmpty(ws.Range(INPUT_UDL_CELL).Value) Then _
         ws.Range(INPUT_UDL_CELL).Value = LANE_UDL
+    ws.Range(INPUT_UDL_CELL).Interior.Color = RGB(230, 240, 255)
     ws.Range(INPUT_UDL_CELL).NumberFormat = "0.00"
     With ws.Range(INPUT_UDL_CELL).Validation
         .Delete
@@ -235,7 +246,7 @@ Private Sub UpdateInputGuidance(ws As Worksheet)
              Operator:=xlGreaterEqual, Formula1:="0"
         .IgnoreBlank = True
         .ErrorTitle = "Invalid lane UDL"
-        .ErrorMessage = "Enter a number >= 0 kN/m. Blank means 9 (CL-625 default)."
+        .ErrorMessage = "Enter a number >= 0 kN/m. Blank means 9; zero removes only the UDL."
         .ShowError = True
     End With
 
@@ -247,7 +258,7 @@ Private Sub UpdateInputGuidance(ws As Worksheet)
     WriteInputNote ws, "C33:D33", "Moving-truck position step (m)."
     WriteInputNote ws, "C34:D34", "Blank = Auto by effect. Override: 0.25 = 25%."
     WriteInputNote ws, "C35:D35", "DLA only: 0 = off; 1 = full; 0.75 = 25% less. Use permitted reductions."
-    WriteInputNote ws, "C36:D36", "Lane UDL in kN/m. Default 9; 7 or 8 for evaluation."
+    WriteInputNote ws, "C36:D36", "Cases 2/3. Blank = 9; 0 = no UDL."
     WriteInputNote ws, "C40:D42", "Up to 10 spans. Enter consecutive lengths; B2 counts this table."
     Dim savedPrintCommunication As Boolean, errorNumber As Long, errorDescription As String
     savedPrintCommunication = Application.PrintCommunication
@@ -316,6 +327,23 @@ Private Sub WriteInputNote(ws As Worksheet, address As String, _
         .Interior.Color = xlColorIndexNone
     End With
 End Sub
+
+Private Function ReadLaneUDL(ws As Worksheet) As Double
+    Dim value As Variant
+    value = ws.Range(INPUT_UDL_CELL).Value
+    If IsError(value) Then GoTo InvalidUDL
+    If Len(Trim$(CStr(value))) = 0 Then
+        ReadLaneUDL = LANE_UDL
+        Exit Function
+    End If
+    If Not IsNumeric(value) Or VarType(value) = vbBoolean Then GoTo InvalidUDL
+    ReadLaneUDL = CDbl(value)
+    If ReadLaneUDL < 0# Then GoTo InvalidUDL
+    Exit Function
+InvalidUDL:
+    Err.Raise vbObjectError + 17, "ReadLaneUDL", _
+              "Lane UDL (B36) must be blank or a number >= 0 kN/m."
+End Function
 
 Private Function ReadDLASettings(ws As Worksheet, _
     ByRef isOverridden As Boolean, ByRef baseDLA As Double, _
@@ -540,26 +568,8 @@ Sub MainAnalysis()
     Dim DLA_Val As Double, DLA_Base As Double, DLA_Multiplier As Double
     Dim isDlaOverridden As Boolean
     DLA_Val = ReadDLASettings(wsIn, isDlaOverridden, DLA_Base, DLA_Multiplier)
-
-    Dim wLaneUDL As Double, udlCell As Variant
-    wLaneUDL = LANE_UDL
-    udlCell = wsIn.Range(INPUT_UDL_CELL).Value
-    If IsError(udlCell) Then
-        Err.Raise vbObjectError + 17, "MainAnalysis", _
-                  "Lane UDL (B36) must be blank or a number >= 0 kN/m."
-    End If
-    If Len(Trim$(CStr(udlCell))) > 0 Then
-        If Not IsNumeric(udlCell) Or VarType(udlCell) = vbBoolean Then
-            Err.Raise vbObjectError + 17, "MainAnalysis", _
-                      "Lane UDL (B36) must be blank or a number >= 0 kN/m."
-        End If
-        wLaneUDL = CDbl(udlCell)
-        If wLaneUDL < 0# Then
-            Err.Raise vbObjectError + 17, "MainAnalysis", _
-                      "Lane UDL (B36) cannot be negative."
-        End If
-    End If
-    m_LaneUDL = wLaneUDL
+    Dim wLaneUDL As Double
+    wLaneUDL = ReadLaneUDL(wsIn)
 
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
@@ -650,7 +660,7 @@ Sub MainAnalysis()
 
     If loadCase >= 2 Then
         Dim tracerIndex As Long, tracerTitle As String, tracerUnits As String
-        ResolveUDLTracerResponse wsIn, xNodes, xShear, supportX, _
+        ResolveUDLTracerResponse xNodes, xShear, supportX, _
                                  tracerIndex, tracerTitle, tracerUnits
     End If
 
@@ -811,7 +821,7 @@ Sub MainAnalysis()
             Not isDlaOverridden, DLA_Base, DLA_Multiplier, 1# + DLA_Val
     End If
     If loadCase >= 2 Then
-        WriteUDLTracer wsIn, xNodes, xShear, supportX, _
+        WriteUDLTracer xNodes, xShear, supportX, _
                        nTotalElems, elemLens, nDOF, E_Val, I_Val, _
                        K_Global, supportDOFs, nSupports
     End If
@@ -927,7 +937,7 @@ Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, _
     ReDim UDL_MaxD(nNodes - 1), UDL_MinD(nNodes - 1)
     ReDim UDL_MaxR(nSupports - 1), UDL_MinR(nSupports - 1)
 
-    If w_udl > 0 Then
+    If w_udl > 0# Or (caseLabel = "Lane" And w_udl = 0#) Then
         Application.StatusBar = caseLabel & ": generating UDL influence zones..."
 
         CalculateUDLEnvelopes numSpans, spanLengths, w_udl, _
@@ -2592,18 +2602,16 @@ End Sub
 ' OUTPUT
 ' ==============================================================================
 
-Private Sub ResolveUDLTracerResponse(wsIn As Worksheet, _
-                                     xNodes() As Double, xShear() As Double, _
+Private Sub ResolveUDLTracerResponse(xNodes() As Double, xShear() As Double, _
                                      supportX() As Double, _
                                      ByRef responseIndex As Long, _
                                      ByRef responseTitle As String, _
-                                     ByRef units As String)
-    ' Tracer inputs (former B36/B37) removed: always trace midspan moment.
-    ' wsIn is retained for the call signature only.
-    Dim offset As Long
+                                     ByRef units As String, _
+                                     Optional tracerResponse As String = "Moment", _
+                                     Optional tracerIndex As Long = 0)
+    Dim kind As String, count As Long, offset As Long, autoIndex As Long
     Dim nV As Long, nM As Long, i As Long, centralNode As Long
     Dim middle As Double, distance As Double, bestDistance As Double
-    Dim selected As Long
     nV = UBound(xShear) + 1
     nM = UBound(xNodes) + 1
     middle = xNodes(nM - 1) / 2#
@@ -2616,30 +2624,76 @@ Private Sub ResolveUDLTracerResponse(wsIn As Worksheet, _
         End If
     Next i
 
-    offset = nV
-    selected = centralNode + 1
-    units = "kNm"
+    kind = LCase$(Trim$(tracerResponse))
+    Select Case kind
+        Case "moment"
+            count = nM
+            offset = nV
+            autoIndex = centralNode + 1
+            units = "kNm"
+        Case "deflection"
+            count = nM
+            offset = nV + nM
+            autoIndex = centralNode + 1
+            units = "m"
+        Case "shear"
+            count = nV
+            autoIndex = 2 * centralNode + 1
+            If autoIndex > count Then autoIndex = count
+            units = "kN"
+        Case "reaction"
+            count = UBound(supportX) + 1
+            offset = nV + 2 * nM
+            autoIndex = 1
+            units = "kN"
+        Case Else
+            Err.Raise vbObjectError + 12, "ResolveUDLTracerResponse", _
+                      "UDL tracer response must be Moment, Shear, Deflection or Reaction."
+    End Select
+
+    Dim selected As Long
+    selected = autoIndex
+    If tracerIndex <> 0 Then
+        If tracerIndex < 1 Or tracerIndex > count Then
+            Err.Raise vbObjectError + 13, "ResolveUDLTracerResponse", _
+                      "UDL tracer index must be between 1 and " & count & "."
+        End If
+        selected = tracerIndex
+    End If
     responseIndex = offset + selected - 1
 
-    responseTitle = "Moment at x=" & Format(xNodes(selected - 1), "0.000") & _
-                    " m (node/index " & selected & ")"
+    Select Case kind
+        Case "reaction"
+            responseTitle = "Reaction at support " & selected & " (x=" & _
+                            Format(supportX(selected - 1), "0.000") & " m)"
+        Case "shear"
+            responseTitle = "Shear at x=" & Format(xShear(selected - 1), "0.000") & _
+                            " m (index " & selected & ", element " & _
+                            ((selected - 1) \ 2 + 1) & _
+                            IIf((selected Mod 2) = 1, ", I end)", ", J end)")
+        Case Else
+            responseTitle = tracerResponse & " at x=" & _
+                            Format(xNodes(selected - 1), "0.000") & _
+                            " m (node/index " & selected & ")"
+    End Select
 End Sub
 
-Private Sub WriteUDLTracer(wsIn As Worksheet, _
-                           xNodes() As Double, xShear() As Double, _
+Private Sub WriteUDLTracer(xNodes() As Double, xShear() As Double, _
                            supportX() As Double, nElems As Long, _
                            elemLens() As Double, nDOF As Long, _
                            E_Val As Double, I_Val As Double, _
                            K_Global() As Double, supportDOFs() As Long, _
-                           nSupports As Long)
+                           nSupports As Long, _
+                           Optional tracerResponse As String = "Moment", _
+                           Optional tracerIndex As Long = 0)
     If Not m_InfluenceReady Or Not m_UDLEnvelopesReady Then
         Err.Raise vbObjectError + 14, "WriteUDLTracer", _
                   "No completed UDL influence analysis is available."
     End If
 
     Dim responseIndex As Long, responseTitle As String, units As String
-    ResolveUDLTracerResponse wsIn, xNodes, xShear, supportX, _
-                             responseIndex, responseTitle, units
+    ResolveUDLTracerResponse xNodes, xShear, supportX, _
+                             responseIndex, responseTitle, units, tracerResponse, tracerIndex
 
     Dim FMax() As Double, FMin() As Double
     Dim loadsMax() As Double, loadsMin() As Double
@@ -2754,8 +2808,10 @@ Private Sub WriteUDLTracer(wsIn As Worksheet, _
                            Format(tolerance, "0.000000000000E+00") & " " & units
     block.Range("A9").Value = "Scope"
     block.Range("B9").Value = "UDL only; each response has its own loading. Truck sweep unchanged."
+    If m_UDLIntensity = 0# Then _
+        block.Range("B9").Value = "UDL is off. Unit influence zones are shown; UDL demand is zero."
     block.Range("A10").Value = "Selection"
-    block.Range("B10").Value = "Tracer fixed to midspan moment."
+    block.Range("B10").Value = "Automatic moment tracer: node nearest the bridge midpoint, not the governing maximum."
     block.Range("A12:E12").Value = Array("Envelope", "Start (m)", "End (m)", _
                                      "Length (m)", "Contribution (" & units & ")")
     block.Range("H12:K12").Value = Array("Load position (m)", "Influence ordinate", _
@@ -3083,8 +3139,7 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
 
     Dim dlaNote As String
     If LCase$(label) = "lane" Then
-        dlaNote = "DLA = 0% (NO LANE DLA); UDL = " & _
-                  Format(m_LaneUDL, "0.00") & " kN/m"
+        dlaNote = "DLA = 0% (NO LANE DLA); UDL = " & Format(m_UDLIntensity, "0.00") & " kN/m"
     ElseIf Not isDlaOverridden Then
         dlaNote = "TRUCK DLA = AUTO PER PLACEMENT; " & _
                   IIf(TRUCK_INFLUENCE_DEPENDENT, "SELECTED AXLES; ", "ALL AXLES ON BRIDGE; ") & _
@@ -3100,9 +3155,8 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
                       "%; multiplier " & Format(DLA_Multiplier, "0.########")
         End If
     End If
-    If LCase$(label) = "envelope" Then
-        dlaNote = dlaNote & "; lane UDL = " & Format(m_LaneUDL, "0.00") & " kN/m"
-    End If
+    If LCase$(label) = "envelope" Then _
+        dlaNote = dlaNote & "; lane UDL = " & Format(m_UDLIntensity, "0.00") & " kN/m"
     ws.Cells(1, colSupp).Value = _
         UCase(label) & " - SUPPORT REACTIONS SUMMARY (" & dlaNote & stepNote & ")" & _
         IIf(TRUCK_INFLUENCE_DEPENDENT, "; influence-dependent, continuous truck search", "; All Points")

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { analyzeBeam, computeAutoDlaInfo, computeEffectiveIncrement, buildTruckPositions,
     truckGroupDla, resolveDla,
     DEFAULT_CONFIG, DEFAULT_SPANS, DEFAULT_AXLES, MAX_SWEEP_STEPS } from '../src/beam-engine.ts';
-import { referenceAnalysis } from './vba-reference.mjs';
+import { referenceAnalysis, referencePartialUdl } from './vba-reference.mjs';
 
 const spansOf = lengths => lengths.map((length, i) => ({ id: `s${i}`, length }));
 const axlesOf = entries => entries.map(([load, spacing], i) => ({ id: `a${i}`, load, spacing }));
@@ -163,7 +163,8 @@ test('envelope governs V/M/D; support summaries are continuous optima bounding t
         });
     }
     assert.equal(result.stats.factorizations, 1);
-    assert.equal(result.stats.udlSolves, 3);
+    assert.equal(result.stats.udlIntegrations, 24 * flatten(result).length);
+    assert.equal(result.stats.influenceSolves, 4 * 24);
     assert.ok(result.stats.truckSolves > 0);
 });
 
@@ -262,9 +263,105 @@ test('invalid input produces explicit errors before allocation or solving', () =
 
 test('12-span lane patterning uses influence zones and finishes within 15 seconds', t => {
     const result = run(spansOf(Array(12).fill(10)), DEFAULT_AXLES, { loadCase: 'envelope' });
-    assert.equal(result.stats.udlSolves, 12);
+    assert.equal(result.stats.udlIntegrations, 480 * flatten(result).length);
     assert.equal(result.stats.factorizations, 1);
     assert.ok(result.stats.truckSolves > 0);
     assert.ok(result.elapsedMs < 15000, `Analysis took ${result.elapsedMs.toFixed(0)}ms`);
     t.diagnostic(`12-span / 40-element envelope: ${result.elapsedMs.toFixed(1)}ms, ${result.stats.truckSolves} truck optimisations`);
+});
+
+test('continuous support uplift matches the exact two-span solution, not sampled minima', () => {
+    const spans = spansOf([8, 8]);
+    const result = run(spans, axlesOf([[100, 0]]), {
+        nElemsPerSpan: 4, dlaOverride: 0, loadCase: 'envelope',
+    });
+    const truckMin = -100 / (6 * Math.sqrt(3));
+    const laneMin = 0.8 * truckMin - 9 * 8 / 16;
+    for (const s of [0, 2]) {
+        close(result.cases.truck.reactions[s].min, truckMin, 1e-10);
+        close(result.cases.lane.reactions[s].min, laneMin, 1e-10);
+        close(result.reactions[s].min, laneMin, 1e-10);
+        const sampled = Math.min(...result.cases.truck.reactionDiagrams[s].map(p => p.min));
+        assert.ok(sampled - result.cases.truck.reactions[s].min > 1e-5,
+            'This benchmark must distinguish the sampled and continuous minimum');
+    }
+});
+
+test('blank lane UDL defaults to 9; zero preserves the 80% lane truck and disables only UDL', () => {
+    const spans = spansOf([4, 7, 3]);
+    const options = { nElemsPerSpan: 6, loadCase: 'lane' };
+    const blank = run(spans, DEFAULT_AXLES, { ...options, laneUdl: null });
+    const omitted = run(spans, DEFAULT_AXLES, { ...options, laneUdl: undefined });
+    const nine = run(spans, DEFAULT_AXLES, { ...options, laneUdl: 9 });
+    assert.equal(blank.config.laneUdl, 9);
+    assert.deepEqual(flatten(blank), flatten(nine));
+    assert.deepEqual(flatten(omitted), flatten(nine));
+    const zero = run(spans, DEFAULT_AXLES, { ...options, laneUdl: 0, dlaOverride: 0.9 });
+    const staticTruck = run(spans, DEFAULT_AXLES, { nElemsPerSpan: 6, dlaOverride: 0 });
+    flatten(zero).forEach((p, i) => {
+        close(p.max, 0.8 * flatten(staticTruck)[i].max, 1e-10);
+        close(p.min, 0.8 * flatten(staticTruck)[i].min, 1e-10);
+    });
+    assert.equal(zero.config.laneUdl, 0);
+    assert.equal(zero.stats.udlIntegrations, 0);
+    assert.equal(zero.udlTracer.intensity, 0);
+    assert.equal(zero.udlTracer.max, 0);
+    assert.equal(zero.udlTracer.min, 0);
+    close(zero.udlTracer.reconstructedMax, 0);
+    close(zero.udlTracer.reconstructedMin, 0);
+    assert.deepEqual(zero.udlTracer.intervals, []);
+    assert.deepEqual(zero.udlTracer.influenceLine, nine.udlTracer.influenceLine);
+    assert.ok(zero.udlTracer.influenceLine.some(p => Math.abs(p.ordinate) > 0.1));
+});
+
+test('automatic UDL tracer selects the nearest midpoint node and verifies exact partial-element loading', () => {
+    for (const lengths of [[8], [2, 15, 7], [4, 9, 1]]) {
+        const spans = spansOf(lengths);
+        const config = { ...DEFAULT_CONFIG, nElemsPerSpan: 4, loadCase: 'lane', laneUdl: 7 };
+        const result = run(spans, axlesOf([[0, 0]]), config);
+        const trace = result.udlTracer;
+        const midpoint = lengths.reduce((a, b) => a + b) / 2;
+        const nearest = result.xNodes.reduce((best, x, i) =>
+            Math.abs(x - midpoint) < Math.abs(result.xNodes[best] - midpoint) ? i : best, 0);
+        assert.equal(trace.nodeIndex, nearest + 1);
+        assert.equal(trace.x, result.xNodes[nearest]);
+        close(trace.max, result.moment[nearest].max, 1e-10);
+        close(trace.min, result.moment[nearest].min, 1e-10);
+        for (const envelope of ['max', 'min']) {
+            const intervals = trace.intervals.filter(i => i.envelope === envelope);
+            intervals.forEach(i => {
+                assert.ok(i.xiStart >= 0 && i.xiEnd <= 1 && i.xiEnd > i.xiStart);
+                assert.ok(envelope === 'max' ? i.contribution > 0 : i.contribution < 0);
+            });
+            close(intervals.reduce((sum, i) => sum + i.contribution, 0), trace[envelope], 1e-10);
+            const independent = referencePartialUdl(spans, config, intervals, trace.intensity);
+            close(independent.moment[nearest], trace[envelope], 1e-9);
+        }
+        assert.ok(Math.abs(trace.reconstructedMax - trace.max) <= trace.tolerance);
+        assert.ok(Math.abs(trace.reconstructedMin - trace.min) <= trace.tolerance);
+        if (lengths.length > 1) {
+            assert.ok(trace.intervals.some(i => i.xiStart > 1e-8 || i.xiEnd < 1 - 1e-8),
+                'The benchmark must exercise a partial element, not just whole-span patterning');
+        }
+    }
+    const truck = run(spansOf([8]), axlesOf([[100, 0]]), { nElemsPerSpan: 4 });
+    assert.equal(truck.udlTracer, undefined);
+});
+
+test('unit influence solves stay in the intended element for very short elements', () => {
+    const result = run(spansOf([8e-6]), axlesOf([[0, 0]]), {
+        loadCase: 'lane', nElemsPerSpan: 16,
+    });
+    close(result.udlTracer.max, 9 * (8e-6) ** 2 / 8, 1e-20);
+    close(result.udlTracer.reconstructedMax, result.udlTracer.max, 1e-20);
+});
+
+test('progress remains monotonic through both cases and UDL verification', () => {
+    const progress = [];
+    analyzeBeam({
+        spans: spansOf([4, 7, 3]), axles: DEFAULT_AXLES,
+        config: { ...DEFAULT_CONFIG, nElemsPerSpan: 4, loadCase: 'envelope' },
+    }, p => progress.push(p.fraction));
+    progress.forEach((f, i) => assert.ok(f >= 0 && f <= 1 && (i === 0 || f >= progress[i - 1])));
+    assert.equal(progress.at(-1), 1);
 });

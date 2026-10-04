@@ -9,20 +9,23 @@ LL Analyzer is a modern, professional web application designed for comprehensive
 - **VBA-Based FEM Analysis:** Continuous Euler-Bernoulli beam analysis using the equations and load rules in [LL Analysis VBA Code.txt](LL%20Analysis%20VBA%20Code.txt), with a cached banded factorization and analysis in an inline web worker.
 - **Advanced Visualizations:** Smooth, interactive SVG-based envelope charts indicating both maximum and minimum envelopes for shear, moment, and deflection.
 - **Responsive Beam Schematics:** Visual representation of beam configurations and support reactions.
-- **Complete Load-Case Results:** Truck, lane, and combined envelopes, upward-positive reaction summaries, exact governing truck positions, individual support reaction diagrams, and an all-supports diagram.
-- **Full-Precision Excel Export:** Input settings, span and axle configurations, and all calculated cases, including reaction histories. Deflections are not rounded to zero.
+- **Complete Load-Case Results:** Truck, lane, and combined envelopes, upward-positive reaction summaries with continuously optimized maxima and uplift minima, and governing truck positions. Sampled reaction histories are retained in Excel, not displayed as charts.
+- **Verified Lane UDL Tracer:** Automatically traces moment at the node nearest the bridge midpoint, showing favorable influence zones and partial-element intervals. Independently reassembles and solves those UDL placements to verify their demands.
+- **Full-Precision Excel Export:** Input settings, span and axle configurations, all calculated cases and reaction histories, plus UDL tracer verification, intervals and influence ordinates for Lane/Envelope analyses. Deflections are not rounded to zero.
 
 ## Analysis Rules and Accuracy
 
-The engine follows the supplied VBA reference:
+The engine follows the calculation rules in the updated supplied VBA reference:
 
 - Pinned vertical supports at every span boundary, continuous rotations, constant material properties, and cubic Hermite consistent point-load vectors.
 - Element force recovery uses `k*u - f_element`; shear has two samples per element to preserve support jumps. Moments are nodal and sagging-positive; deflections are in meters; reactions are upward-positive kN.
-- The truck runs in both axle orientations. Automatic DLA is evaluated on **every span**, governing with 40% for one axle, 30% for two, and 25% for three or more. A nonnegative user override applies only to the truck-only case.
-- The lane case is **0.8 times the truck plus 9 kN/m patterned span UDL, with no DLA** on either portion. Loaded/unloaded patterns include the empty pattern. Each response ordinate has its own governing pattern.
+- The truck runs in both axle orientations. For each response and placement, favorable axles are selected by the sign of their influence contribution. Automatic DLA is 40% for one selected axle, 30% for two or the original front-three group, and 25% for other groups of three or more. A multiplier `d` in [0,1] scales only DLA; a nonnegative manual override is also multiplied by `d`. Neither applies to the lane case.
+- The lane case is **0.8 times the selected truck plus configurable influence-zone UDL, with no DLA** on either portion. Blank UDL defaults to 9 kN/m; zero removes only UDL, leaving the 80% lane truck. Each response has its own positive/negative loaded zones, including partial elements, and UDL may overlap the truck.
+- Truck extrema are found by continuous piecewise-cubic optimization, including stationary points and one-sided element boundaries, rather than relying on the sweep grid. Both support maxima and minima/uplift use these continuous extrema; reaction-history exports remain sampled.
 - Envelope mode retains separate Truck and Lane results as well as their pointwise combined envelope; use **Display load case** to inspect each.
+- The automatic UDL tracer selects the moment node nearest the overall bridge midpoint (earlier node in an exact tie), **not** the governing moment location. It shows UDL-only contributions, favorable intervals and unit influence ordinates. Partial-element consistent load vectors are assembled and solved separately; a failed reconstruction raises an explicit analysis error using the VBA tolerance of `1e-9 + 1e-7 * max(abs(max), abs(min))` kNm. With zero UDL, demand and loaded intervals are zero/empty, but unit influence zones remain visible.
 
-The app uses mathematically equivalent optimizations rather than repeating unnecessary solves: the stiffness matrix is factorized once with banded LDL^T (equivalent to the reference's LU); the unscaled truck sweep is shared between cases; and positive/negative contributions from individual span UDL responses give the exact extrema of all `2^n` patterns in just `n` solves.
+The stiffness matrix is factorized once with banded LDL^T (equivalent to the reference's LU). Four unit point-load solves within each element recover its exact cubic influence functions, shared across cases. Their roots partition the positive/negative UDL zones for exact integration; selected truck responses are optimized continuously in both orientations. The UI reports actual unit-load solves and element/response UDL integrations, not fictitious whole-span UDL solves. Two additional factored-system solves verify the automatic lane tracer.
 
 ### Sweep resolution and intentional safeguards
 
@@ -32,10 +35,10 @@ Compared with the reference, the app deliberately:
 
 - **Enforces** the step floor and count cap even when the base step is smaller (the VBA's final base-step clamp can undo these safeguards).
 - Includes the end of the sweep and both signs of the reference's support-target offsets. A common exact-coordinate grid is evaluated in both axle orientations. Additional alignment samples may improve extrema slightly compared with the reference's separately sampled passes.
-- Stores targeted reaction samples at their **actual lead positions**, instead of binning them into a nearby uniform position; the governing position and diagram ordinate remain consistent.
-- Rejects invalid inputs explicitly: fractional element counts, non-finite/nonpositive stiffness and geometry, negative loads/spacings or DLA, and unsupported cases. Limits are 20 axles, 12 spans for lane/envelope cases, 10,000 total elements, and 2,000,000 reaction-history ordinates per case.
+- Stores targeted reaction samples at their **actual lead positions**, instead of binning them into a nearby uniform position. Continuously optimized governing positions may lie between sampled history ordinates.
+- Rejects invalid inputs explicitly: fractional element counts, non-finite/nonpositive stiffness and geometry, negative loads/spacings, UDL or DLA, invalid `d`, and unsupported cases. Limits are 20 axles, 12 spans for lane/envelope cases, 1,000 total elements, and 2,000,000 reaction-history ordinates per case. The web app retains support for 12 lane/envelope spans versus the VBA worksheet's 10 input rows.
 
-Regression tests compare the optimized engine against an independent dense LU implementation of the VBA equations, exhaustive lane patterns, and exact simply supported point-load/UDL solutions. These verify numerical implementation, not independent MIDAS Civil certification. Matching a specific MIDAS model still requires identical properties, load factors, lane patterning, signs, output stations and moving-load resolution, followed by a project-specific benchmark. For design use, check mesh/sweep convergence and have results reviewed by a qualified engineer.
+Regression tests compare continuous extrema against the legacy dense LU/whole-span-pattern baseline, exact simply supported solutions and exact two-span uplift. Traced partial-element placements are also checked with an independent dense LU solver using Gauss quadrature for load-vector integration. These verify numerical implementation, not independent MIDAS Civil certification. Matching a specific MIDAS model still requires identical properties, load factors, influence-zone loading, signs, output stations and moving-load rules, followed by a project-specific benchmark. For design use, check mesh convergence and have results reviewed by a qualified engineer.
 
 ## How to Use
 
@@ -47,7 +50,7 @@ Regression tests compare the optimized engine against an independent dense LU im
 3. **Axle Setup:** 
    - Define custom axles and their respective loads (kN) and spacings (m).
 4. **Analysis & Results:** 
-   - Click **Run Analysis**. Progress is shown while the UI remains responsive. Inspect shear, moment, deflection, support summaries and reaction diagrams, then export all calculated cases.
+   - Click **Run Analysis**. Progress is shown while the UI remains responsive. Inspect shear, moment, deflection, support summaries and the automatic lane UDL tracer, then export all calculated cases and sampled reaction histories.
    - Results and exports retain the analyzed input snapshot; changing configuration does not relabel previous results.
 
 ## Development & Running Locally
@@ -66,7 +69,7 @@ The app is a single npm project directly in the repository root, with one `packa
 
 Run all npm commands from this folder, not a subfolder.
 
-Editing `LL Analysis VBA Code.txt` does not automatically update the web solver. The current app upgrade was validated against the VBA reference at commit `902f3e8`; newer local VBA edits must be separately ported and validated.
+Editing `LL Analysis VBA Code.txt` does not automatically update the web solver. The web engine has been compared with the updated reference, including selected-axle DLA, continuous truck optimization, partial-element UDL zones, blank/zero UDL handling and automatic tracer verification. Excel worksheet layout/migration and VBA-only truck diagnostics are not reproduced in the web UI; further reference edits still need separate review and validation.
 
 1. Install dependencies:
    ```bash

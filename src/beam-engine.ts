@@ -9,10 +9,33 @@ export type AnalysisConfig = {
     loadCase: LoadCase;
     dlaOverride?: number | null;
     dlaMultiplier?: number;
-    laneUdl?: number;
+    laneUdl?: number | null;
 };
 export type EnvelopePoint = { x: number; max: number; min: number };
 export type ReactionEnvelope = EnvelopePoint & { govPos: number };
+export type UdlInterval = {
+    envelope: 'max' | 'min';
+    element: number;
+    xiStart: number;
+    xiEnd: number;
+    start: number;
+    end: number;
+    contribution: number;
+};
+export type UdlTracer = {
+    response: 'moment';
+    nodeIndex: number;
+    x: number;
+    unit: 'kNm';
+    intensity: number;
+    max: number;
+    min: number;
+    reconstructedMax: number;
+    reconstructedMin: number;
+    tolerance: number;
+    intervals: UdlInterval[];
+    influenceLine: (EnvelopePoint & { ordinate: number })[];
+};
 export type CaseResults = {
     shear: EnvelopePoint[];
     moment: EnvelopePoint[];
@@ -37,7 +60,8 @@ export type AnalysisResults = CaseResults & {
     baseIncrement: number;
     incrementReason: string;
     elapsedMs: number;
-    stats: { factorizations: number; truckSolves: number; udlSolves: number };
+    udlTracer?: UdlTracer;
+    stats: { factorizations: number; truckSolves: number; influenceSolves: number; udlIntegrations: number };
 };
 export type AnalysisProgress = { fraction: number; message: string };
 export type AnalysisRequest = { spans: Span[]; axles: Axle[]; config: AnalysisConfig };
@@ -65,13 +89,14 @@ export const MAX_AXLES = 20;
 export const MAX_SWEEP_STEPS = 6000;
 const MIN_SWEEP_STEP = 0.02;
 const BAND = 3;
-// VBA parity constants (verified against Midas Civil)
+// Load rules from the supplied VBA reference; MIDAS parity needs a matching benchmark.
 const DLA_FACTOR = 0.25;
 const LANE_TRUCK_FACTOR = 0.8;
 const LANE_UDL = 9;
 const MAX_TOTAL_ELEMENTS = 1000;
 const INFLUENCE_ROOT_TOL = 1e-10;
 const INFLUENCE_VALUE_TOL = 1e-12;
+const UDL_VERIFY_TOL = 1e-7;
 
 function maxAxlesOnLength(length: number, axles: Axle[]): number {
     let best = 1;
@@ -365,14 +390,19 @@ class BeamSystem {
         }
         const le = this.lengths[low];
         const xi = Math.max(0, Math.min(1, (pos - this.xNodes[low]) / le));
+        this.elementPointLoad(low, xi, magnitude);
+    }
+
+    private elementPointLoad(element: number, xi: number, magnitude: number): void {
+        const le = this.lengths[element];
         const x2 = xi * xi;
         const x3 = x2 * xi;
         const shapes = [1 - 3 * x2 + 2 * x3, le * (xi - 2 * x2 + x3),
             3 * x2 - 2 * x3, le * (-x2 + x3)];
         for (let i = 0; i < 4; i++) {
             const value = -magnitude * shapes[i] * 1000;
-            this.load[low * 2 + i] += value;
-            this.elemLoads[low * 4 + i] += value;
+            this.load[element * 2 + i] += value;
+            this.elemLoads[element * 4 + i] += value;
         }
     }
 
@@ -387,11 +417,38 @@ class BeamSystem {
     }
 
     /** Solve a unit (1 kN) point load and return a copy of the packed response. */
-    unitResponse(position: number): Float64Array {
+    unitResponse(element: number, xi: number): Float64Array {
         this.clearLoads();
-        this.pointLoad(position, 1);
+        this.elementPointLoad(element, xi, 1);
         this.solve();
         return this.response.slice();
+    }
+
+    partialUdlResponse(intervals: UdlInterval[], envelope: 'max' | 'min', w: number): Float64Array {
+        this.clearLoads();
+        for (const interval of intervals) {
+            if (interval.envelope !== envelope) continue;
+            const e = interval.element - 1;
+            const le = this.lengths[e];
+            const a = interval.xiStart;
+            const b = interval.xiEnd;
+            const i0 = b - a;
+            const i1 = i0 * (a + b) / 2;
+            const i2 = i0 * (a * a + a * b + b * b) / 3;
+            const i3 = i0 * (a ** 3 + a * a * b + a * b * b + b ** 3) / 4;
+            const factor = -w * le * 1000;
+            const values = [
+                factor * (i0 - 3 * i2 + 2 * i3),
+                factor * le * (i1 - 2 * i2 + i3),
+                factor * (3 * i2 - 2 * i3),
+                factor * le * (-i2 + i3),
+            ];
+            for (let i = 0; i < 4; i++) {
+                this.load[e * 2 + i] += values[i];
+                this.elemLoads[e * 4 + i] += values[i];
+            }
+        }
+        return this.solve();
     }
 
     private solve(): Float64Array {
@@ -437,7 +494,7 @@ class BeamSystem {
 }
 
 // ---------------------------------------------------------------------------
-// VBA-parity influence engine (verified against Midas Civil)
+// VBA-parity influence engine
 // FEA + influence-line UDL placement, continuous truck optimisation,
 // placement-dependent selected-axle DLA with d multiplier.
 // ---------------------------------------------------------------------------
@@ -614,11 +671,9 @@ function buildInfluenceCache(system: BeamSystem): { coeffs: Float64Array; nRespo
     const coeffs = new Float64Array(nElems * nResponses * 4);
     const xs = [0.125, 0.375, 0.625, 0.875];
     for (let e = 0; e < nElems; e++) {
-        const le = system.lengths[e];
-        const x0 = system.xNodes[e];
         const samples: Float64Array[] = [];
         for (let p = 0; p < 4; p++) {
-            samples.push(system.unitResponse(x0 + xs[p] * le));
+            samples.push(system.unitResponse(e, xs[p]));
         }
         for (let r = 0; r < nResponses; r++) {
             const fitted = fitInfluenceCubic(samples[0][r], samples[1][r], samples[2][r], samples[3][r]);
@@ -656,6 +711,64 @@ function calculateUDLEnvelopes(
         }
     }
     return { max, min };
+}
+
+function buildUdlTracer(
+    system: BeamSystem, coeffs: Float64Array, nResponses: number, w: number,
+    udlMax: Float64Array, udlMin: Float64Array
+): UdlTracer {
+    const middle = system.xNodes[system.nElems] / 2;
+    let node = 0;
+    for (let i = 1; i < system.nNodes; i++) {
+        if (Math.abs(system.xNodes[i] - middle) < Math.abs(system.xNodes[node] - middle)) node = i;
+    }
+    const response = system.momentOffset + node;
+    const intervals: UdlInterval[] = [];
+    const influenceLine: UdlTracer['influenceLine'] = [];
+    for (let e = 0; e < system.nElems; e++) {
+        const base = (e * nResponses + response) * 4;
+        const coeff = coeffs.subarray(base, base + 4);
+        const cuts = influenceCuts(coeff);
+        for (let i = 0; i < cuts.length - 1; i++) {
+            const a = cuts[i];
+            const b = cuts[i + 1];
+            const contribution = w * system.lengths[e] * influenceIntegral(coeff, a, b);
+            if (contribution !== 0) {
+                intervals.push({
+                    envelope: contribution > 0 ? 'max' : 'min', element: e + 1,
+                    xiStart: a, xiEnd: b,
+                    start: system.xNodes[e] + system.lengths[e] * a,
+                    end: system.xNodes[e] + system.lengths[e] * b,
+                    contribution,
+                });
+            }
+        }
+        const plotCuts = [...cuts];
+        for (let i = 0; i <= 8; i++) insertInfluenceCut(plotCuts, i / 8);
+        plotCuts.sort((a, b) => a - b);
+        for (const xi of plotCuts) {
+            const ordinate = influenceValue(coeff, xi);
+            influenceLine.push({
+                x: system.xNodes[e] + system.lengths[e] * xi, ordinate,
+                max: Math.max(0, ordinate), min: Math.min(0, ordinate),
+            });
+        }
+    }
+    const max = udlMax[response];
+    const min = udlMin[response];
+    const reconstructedMax = system.partialUdlResponse(intervals, 'max', w)[response];
+    const reconstructedMin = system.partialUdlResponse(intervals, 'min', w)[response];
+    const tolerance = 1e-9 + UDL_VERIFY_TOL * Math.max(Math.abs(max), Math.abs(min));
+    if (!Number.isFinite(max) || !Number.isFinite(min) ||
+        Math.abs(reconstructedMax - max) > tolerance || Math.abs(reconstructedMin - min) > tolerance) {
+        throw new Error(`Partial-UDL FEM reconstruction failed at moment node ${node + 1}: ` +
+            `max ${reconstructedMax} versus ${max}; min ${reconstructedMin} versus ${min}.`);
+    }
+    return {
+        response: 'moment', nodeIndex: node + 1, x: system.xNodes[node], unit: 'kNm',
+        intensity: w, max, min, reconstructedMax, reconstructedMin, tolerance,
+        intervals, influenceLine,
+    };
 }
 
 type PolyResult = { poly: Float64Array; masks: Int32Array; bases: Float64Array };
@@ -1199,7 +1312,7 @@ export function analyzeBeam(
         throw new Error('Reaction histories exceed 2,000,000 ordinates per case. Reduce the span or axle count.');
     onProgress?.({ fraction: 0.02, message: 'Generating influence functions...' });
     const { coeffs } = buildInfluenceCache(system);
-    let udlSolves = 0;
+    let udlIntegrations = 0;
     const baseAxles = axles.map(a => a.load);
     const spacings = axles.map(a => a.spacing);
     const nAxles = axles.length;
@@ -1209,12 +1322,16 @@ export function analyzeBeam(
         autoDLA: boolean, multiplier: number
     ) => {
         const { max: udlMax, min: udlMin } = calculateUDLEnvelopes(coeffs, nElems, nResponses, system.lengths, wUdl);
-        if (wUdl > 0) udlSolves += spans.length; // span-equivalent reporting (influence zones are exact)
+        if (wUdl > 0) udlIntegrations += nElems * nResponses;
         const env = runInfluenceTruckEnvelope(
             axleFactor, autoDLA, multiplier, baseAxles, spacings, nAxles,
             system.xNodes, nElems, nResponses, coeffs, positions, nSupports,
             udlMax, udlMin,
-            (fraction, message) => onProgress?.({ fraction: 0.02 + fraction * (label === 'Truck' ? 0.49 : 0.49), message }),
+            (fraction, message) => onProgress?.({
+                fraction: (config.loadCase === 'envelope' && label === 'Lane' ? 0.48 : 0.02) +
+                    fraction * (config.loadCase === 'envelope' ? 0.46 : 0.92),
+                message,
+            }),
             label
         );
         // Final envelopes: continuous truck optima + UDL zones
@@ -1229,8 +1346,6 @@ export function analyzeBeam(
 
     type BuiltCase = ReturnType<typeof runCase> & { dlaAuto: boolean; dlaBase: number; dlaMultiplier: number; dlaUsed: number };
     const built: Partial<Record<LoadCase, BuiltCase>> = {};
-    const progressShim = (f: number, m: string) => onProgress?.({ fraction: f, message: m });
-    void progressShim;
     if (config.loadCase !== 'lane') {
         const axleFactor = 1 + (dla.isAuto ? 0 : dla.effective);
         const t = runCase('Truck', axleFactor, 0, dla.isAuto, dla.multiplier);
@@ -1250,15 +1365,9 @@ export function analyzeBeam(
             positions.map((x, p) => ({
                 x, max: b.histMax[p * nSupports + s], min: b.histMin[p * nSupports + s],
             })));
-        const reactions: ReactionEnvelope[] = system.supports.map((x, s) => {
-            // Optimised continuous summary (VBA parity); govPos may lie off the sampled grid.
-            let min = Infinity;
-            for (let p = 0; p < positions.length; p++) {
-                const v = b.histMin[p * nSupports + s];
-                if (v < min) min = v;
-            }
-            return { x, max: b.optMax[s], min, govPos: b.optGov[s] };
-        });
+        const reactions: ReactionEnvelope[] = system.supports.map((x, s) => ({
+            x, max: b.optMax[s], min: b.optMin[s], govPos: b.optGov[s],
+        }));
         return {
             shear, moment, deflection, reactionDiagrams, reactions,
             dlaUsed: b.dlaUsed, dlaAuto: b.dlaAuto, dlaBase: b.dlaBase, dlaMultiplier: b.dlaMultiplier,
@@ -1309,6 +1418,10 @@ export function analyzeBeam(
     }
     const selected = cases[config.loadCase];
     if (!selected) throw new Error('The selected load case was not calculated.');
+    if (built.lane) onProgress?.({ fraction: 0.95, message: 'Verifying partial-UDL influence zones...' });
+    const udlTracer = built.lane
+        ? buildUdlTracer(system, coeffs, nResponses, config.laneUdl ?? LANE_UDL, built.lane.udlMax, built.lane.udlMin)
+        : undefined;
     onProgress?.({ fraction: 1, message: 'Analysis complete.' });
     let truckSolves = 0;
     if (built.truck) truckSolves += built.truck.truckSolves;
@@ -1319,6 +1432,7 @@ export function analyzeBeam(
         xNodes: system.xNodes, supportPositions: system.supports, truckPositions: positions,
         incrementUsed: stepInfo.effective, baseIncrement: config.truckIncrement,
         incrementReason: stepInfo.reason, elapsedMs: performance.now() - started,
-        stats: { factorizations: 1, truckSolves, udlSolves },
+        udlTracer,
+        stats: { factorizations: 1, truckSolves, influenceSolves: 4 * nElems, udlIntegrations },
     };
 }
