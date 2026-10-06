@@ -1,7 +1,7 @@
 Option Explicit
 
 ' ==============================================================================
-' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 TRUCK)
+' FINITE ELEMENT ANALYSIS FOR CONTINUOUS BEAM (CL-625 / BCL-625 TRUCK)
 ' Fixes: Variable Spans, Error Handling, Stepped Shear, Support Reaction Diagrams
 ' Lane UDL: positive/negative influence zones, including partial elements.
 ' NO lane-load DLA, placement-dependent truck DLA,
@@ -16,6 +16,10 @@ Const MAX_INPUT_SPANS As Long = 10
 Const INPUT_SPAN_FIRST_ROW As Long = 41
 Const INPUT_AXLE_FIRST_ROW As Long = 10
 Const INPUT_CASE_CELL As String = "B7"
+Const INPUT_TRUCK_CELL As String = "B8"
+Const BCL_MIN_SPACING As Double = 6.6
+Const BCL_MAX_SPACING As Double = 18#
+Const BCL_SPACING_INCREMENT As Double = 0.5
 Const INPUT_ELEMENTS_CELL As String = "B32"
 Const INPUT_INCREMENT_CELL As String = "B33"
 Const INPUT_DLA_CELL As String = "B34"
@@ -38,6 +42,7 @@ Const LANE_UDL As Double = 9
 Private N_ELEMS_PER_SPAN As Long
 Private TRUCK_INCREMENT As Double
 Private EFF_TRUCK_INCREMENT As Double
+Private m_IsBCLTruck As Boolean
 
 ' Cached LU factorisation of the reduced stiffness matrix.
 Private m_LU() As Double
@@ -59,6 +64,7 @@ Private m_TruckGovSide() As Long
 Private m_TruckGovReverse() As Boolean
 Private m_TruckGovBase() As Double
 Private m_TruckGovValue() As Double
+Private m_TruckGovSpacing() As Double
 Private m_TruckGovReady As Boolean
 
 Private Type TruckGeometry
@@ -122,6 +128,7 @@ Private Sub BuildInputLayout(ws As Worksheet)
     ws.Range("A3").Value = "Modulus of Elasticity (E):"
     ws.Range("A4").Value = "Moment of Inertia (I):"
     ws.Range("A7").Value = "Load Case:"
+    ws.Range("A8").Value = "Truck Model:"
     ws.Range("A9:C9").Value = Array("Axle", "Load (kN)", "Next spacing (m)")
     ws.Range("A32").Value = "Elements per Span:"
     ws.Range("A33").Value = "Truck Increment (m):"
@@ -139,7 +146,7 @@ Private Sub BuildInputLayout(ws As Worksheet)
     Next heading
     ws.Range("A6").Value = "LOAD CONFIGURATION"
     ws.Range("A31").Value = "ANALYSIS SETTINGS"
-    ws.Range("B3:B4,B7,B10:C29,B32:B36").Interior.Color = RGB(230, 240, 255)
+    ws.Range("B3:B4,B7:B8,B10:C29,B32:B36").Interior.Color = RGB(230, 240, 255)
     ws.Range("A9:C29").Borders.LineStyle = xlContinuous
     ws.Range("A9:C9").Font.Bold = True
     ws.Range("A9:C9").WrapText = True
@@ -214,15 +221,29 @@ End Sub
 
 Private Sub UpdateInputGuidance(ws As Worksheet)
     ws.Rows("1:50").RowHeight = 13
-    ws.Range("A5,A8,A30").EntireRow.RowHeight = 4
+    ws.Range("A5,A30").EntireRow.RowHeight = 4
     ws.Range("A3:A4,A32:A33").EntireRow.RowHeight = 15
     ws.Rows(1).RowHeight = 20
-    ws.Rows(7).RowHeight = 25
+    ws.Rows("7:8").RowHeight = 25
     ws.Rows(9).RowHeight = 27
     ws.Rows("34:36").RowHeight = 26
     ws.Range("B2").Formula = "=COUNT(B" & INPUT_SPAN_FIRST_ROW & ":B" & _
                              (INPUT_SPAN_FIRST_ROW + MAX_INPUT_SPANS - 1) & ")"
     ws.Range("B2").Calculate
+    ws.Range("A8").Value = "Truck Model:"
+    If IsEmpty(ws.Range(INPUT_TRUCK_CELL).Value) Then _
+        ws.Range(INPUT_TRUCK_CELL).Value = "CL-625"
+    ws.Range(INPUT_TRUCK_CELL).Interior.Color = RGB(230, 240, 255)
+    With ws.Range(INPUT_TRUCK_CELL).Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, _
+             Formula1:="CL-625" & Application.International(xlListSeparator) & "BCL-625"
+        .IgnoreBlank = True
+        .ErrorTitle = "Invalid truck model"
+        .ErrorMessage = "Select CL-625 or BCL-625. Blank means CL-625."
+        .ShowError = True
+        .InCellDropdown = True
+    End With
     If IsEmpty(ws.Range(INPUT_DLA_MULTIPLIER_CELL).Value) Then _
         ws.Range(INPUT_DLA_MULTIPLIER_CELL).Value = 1#
     ws.Range(INPUT_DLA_MULTIPLIER_CELL).NumberFormat = "0.00########"
@@ -253,7 +274,8 @@ Private Sub UpdateInputGuidance(ws As Worksheet)
     WriteInputNote ws, "C3:D3", "E in Pa."
     WriteInputNote ws, "C4:D4", "I in m^4."
     WriteInputNote ws, "C7:D7", "1 = Truck; 2 = Lane load; 3 = Envelope."
-    WriteInputNote ws, "D10:D16", "Up to 20 axles, in consecutive rows. Final axle spacing is ignored."
+    WriteInputNote ws, "C8:D8", "CL: axle table. BCL: preset + variable gap."
+    WriteInputNote ws, "D10:D16", "CL: up to 20 axles; final spacing ignored. BCL ignores this table: 50/140/140/175/120 kN; gaps 3.6/1.2/V/6.6 m. V = 6.6 to 17.6 by 0.5, plus 18 m."
     WriteInputNote ws, "C32:D32", "FEM mesh resolution."
     WriteInputNote ws, "C33:D33", "Moving-truck position step (m)."
     WriteInputNote ws, "C34:D34", "Blank = Auto by effect. Override: 0.25 = 25%."
@@ -309,6 +331,42 @@ PrintSetupFailed:
     Application.PrintCommunication = savedPrintCommunication
     Err.Raise errorNumber, "UpdateInputGuidance", errorDescription
 End Sub
+
+Private Function ReadTruckModel(ws As Worksheet) As Boolean
+    Dim value As Variant, model As String
+    value = ws.Range(INPUT_TRUCK_CELL).Value
+    If IsError(value) Then GoTo InvalidModel
+    model = UCase$(Trim$(CStr(value)))
+    Select Case model
+        Case "", "CL-625"
+            ReadTruckModel = False
+        Case "BCL-625"
+            ReadTruckModel = True
+        Case Else
+            GoTo InvalidModel
+    End Select
+    Exit Function
+InvalidModel:
+    Err.Raise vbObjectError + 26, "ReadTruckModel", _
+              "Truck Model (B8) must be CL-625 or BCL-625. Blank means CL-625."
+End Function
+
+Private Function TruckSpacingCount() As Long
+    TruckSpacingCount = 1
+    If m_IsBCLTruck Then
+        TruckSpacingCount = CLng(Int((BCL_MAX_SPACING - BCL_MIN_SPACING) / BCL_SPACING_INCREMENT)) + 2
+    End If
+End Function
+
+Private Function TruckSpacingAt(index As Long) As Double
+    If index < 0 Or index >= TruckSpacingCount() Then _
+        Err.Raise vbObjectError + 27, "TruckSpacingAt", "Invalid truck spacing index."
+    If index = TruckSpacingCount() - 1 Then
+        TruckSpacingAt = BCL_MAX_SPACING
+    Else
+        TruckSpacingAt = BCL_MIN_SPACING + index * BCL_SPACING_INCREMENT
+    End If
+End Function
 
 Private Sub WriteInputNote(ws As Worksheet, address As String, _
                            noteText As String)
@@ -535,15 +593,20 @@ Sub MainAnalysis()
         Exit Sub
     End If
 
-    ' Read axle loads down to the first blank or non-numeric cell.
+    m_IsBCLTruck = ReadTruckModel(wsIn)
+    ' CL-625 retains the existing editable axle table.
     Dim nAxles As Long
     nAxles = 0
 
-    For i = 0 To MAX_AXLES - 1
-        If IsEmpty(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Or _
-           Not IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Then Exit For
-        nAxles = nAxles + 1
-    Next i
+    If m_IsBCLTruck Then
+        nAxles = 5
+    Else
+        For i = 0 To MAX_AXLES - 1
+            If IsEmpty(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Or _
+               Not IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value) Then Exit For
+            nAxles = nAxles + 1
+        Next i
+    End If
 
     If nAxles < 1 Then
         MsgBox "No axle loads found. Enter at least one axle load starting in cell B10.", vbCritical
@@ -554,16 +617,25 @@ Sub MainAnalysis()
     ReDim axles(nAxles - 1)
     ReDim spacings(nAxles - 1)
 
-    For i = 0 To nAxles - 1
-        axles(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value)
+    If m_IsBCLTruck Then
+        Dim bclLoads As Variant, bclGaps As Variant
+        bclLoads = Array(50#, 140#, 140#, 175#, 120#)
+        bclGaps = Array(3.6, 1.2, BCL_MIN_SPACING, 6.6, 0#)
+        For i = 0 To nAxles - 1
+            axles(i) = bclLoads(i): spacings(i) = bclGaps(i)
+        Next i
+    Else
+        For i = 0 To nAxles - 1
+            axles(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 2).Value)
 
-        If i < nAxles - 1 Then
-            If IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value) Then
-                spacings(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value)
+            If i < nAxles - 1 Then
+                If IsNumeric(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value) Then
+                    spacings(i) = CDbl(wsIn.Cells(INPUT_AXLE_FIRST_ROW + i, 3).Value)
+                End If
+                If spacings(i) < 0 Then spacings(i) = 0
             End If
-            If spacings(i) < 0 Then spacings(i) = 0
-        End If
-    Next i
+        Next i
+    End If
 
     Dim DLA_Val As Double, DLA_Base As Double, DLA_Multiplier As Double
     Dim isDlaOverridden As Boolean
@@ -671,6 +743,7 @@ Sub MainAnalysis()
     For j = 0 To nAxles - 2
         truckLen = truckLen + spacings(j)
     Next j
+    If m_IsBCLTruck Then truckLen = truckLen + BCL_MAX_SPACING - BCL_MIN_SPACING
 
     EFF_TRUCK_INCREMENT = ComputeEffectiveIncrement( _
         TRUCK_INCREMENT, spanLengths, numSpans, spacings, nAxles, _
@@ -892,6 +965,10 @@ Sub RunLoadCaseEnvelope(caseLabel As String, axleFactor As Double, _
     If influenceDependent And (nAxles < 1 Or nAxles > MAX_AXLES) Then
         Err.Raise vbObjectError + 25, "RunLoadCaseEnvelope", _
                   "Influence-dependent loading requires 1 to " & MAX_AXLES & " truck axles."
+    End If
+    If m_IsBCLTruck And (Not influenceDependent Or nAxles <> 5) Then
+        Err.Raise vbObjectError + 28, "RunLoadCaseEnvelope", _
+                  "BCL-625 requires five axles and influence-dependent truck analysis."
     End If
 
     Dim i As Long, j As Long, p As Long, s As Long
@@ -1492,6 +1569,7 @@ Private Sub RunInfluenceTruckEnvelope(caseLabel As String, axleFactor As Double,
     Dim forwardWeights() As Double, reverseWeights() As Double, forwardOffsets() As Double, reverseOffsets() As Double
     Dim forwardGeometry As TruckGeometry, reverseGeometry As TruckGeometry, emptyGeometry As TruckGeometry
     Dim responseIsZero As Boolean
+    Dim spacingIndex As Long, activeSpacings() As Double
     nResponses = UBound(m_InfluenceCoeffs, 2) + 1
     rOffset = 4 * nElems + 2
     ReDim nodes(nElems), weights(nAxles - 1), offsets(nAxles - 1), maxima(nResponses - 1), minima(nResponses - 1)
@@ -1501,83 +1579,97 @@ Private Sub RunInfluenceTruckEnvelope(caseLabel As String, axleFactor As Double,
         ReDim m_TruckGovLead(1, nResponses - 1), m_TruckGovMask(1, nResponses - 1)
         ReDim m_TruckGovSide(1, nResponses - 1), m_TruckGovReverse(1, nResponses - 1)
         ReDim m_TruckGovBase(1, nResponses - 1), m_TruckGovValue(1, nResponses - 1)
+        ReDim m_TruckGovSpacing(1, nResponses - 1)
+        If m_IsBCLTruck Then
+            For r = 0 To nResponses - 1
+                m_TruckGovSpacing(0, r) = BCL_MIN_SPACING
+                m_TruckGovSpacing(1, r) = BCL_MIN_SPACING
+            Next r
+        End If
     End If
     For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
-    For direction = 0 To 1
-        offsets(0) = 0#
-        For i = 0 To nAxles - 1
-            If direction = 0 Then weights(i) = axles(i) Else weights(i) = axles(nAxles - 1 - i)
-            If i > 0 Then
-                If direction = 0 Then
-                    offsets(i) = offsets(i - 1) + spacings(i - 1)
-                Else
-                    offsets(i) = offsets(i - 1) + spacings(nAxles - 1 - i)
+    ' Keep all envelopes and governing records across spacing configurations.
+    For spacingIndex = 0 To TruckSpacingCount() - 1
+        activeSpacings = spacings
+        If m_IsBCLTruck Then activeSpacings(2) = TruckSpacingAt(spacingIndex)
+        For direction = 0 To 1
+            offsets(0) = 0#
+            For i = 0 To nAxles - 1
+                If direction = 0 Then weights(i) = axles(i) Else weights(i) = axles(nAxles - 1 - i)
+                If i > 0 Then
+                    If direction = 0 Then
+                        offsets(i) = offsets(i - 1) + activeSpacings(i - 1)
+                    Else
+                        offsets(i) = offsets(i - 1) + activeSpacings(nAxles - 1 - i)
+                    End If
                 End If
+            Next i
+            If direction = 0 Then
+                forwardWeights = weights: forwardOffsets = offsets
+                BuildTruckGeometry nodes, offsets, nAxles, forwardGeometry
+            Else
+                reverseWeights = weights: reverseOffsets = offsets
+                BuildTruckGeometry nodes, offsets, nAxles, reverseGeometry
             End If
-        Next i
-        If direction = 0 Then
-            forwardWeights = weights: forwardOffsets = offsets
-            BuildTruckGeometry nodes, offsets, nAxles, forwardGeometry
-        Else
-            reverseWeights = weights: reverseOffsets = offsets
-            BuildTruckGeometry nodes, offsets, nAxles, reverseGeometry
-        End If
-    Next direction
-    For r = 0 To nResponses - 1
-        If r Mod 20 = 0 Then
-            DoEvents
-            Application.StatusBar = caseLabel & ": optimizing truck response " & (r + 1) & " of " & nResponses
-        End If
-        PrepareTruckResponse r, nodes, knots, responseCoeffs, responseIsZero
-        If responseIsZero Then GoTo NextTruckResponse
+        Next direction
+        For r = 0 To nResponses - 1
+            If r Mod 20 = 0 Then
+                DoEvents
+                Application.StatusBar = caseLabel & ": truck configuration " & (spacingIndex + 1) & _
+                    "/" & TruckSpacingCount() & "; optimizing response " & (r + 1) & " of " & nResponses
+            End If
+            PrepareTruckResponse r, nodes, knots, responseCoeffs, responseIsZero
+            If responseIsZero Then GoTo NextTruckResponse
+            For direction = 0 To 1
+                If direction = 0 Then
+                    weights = forwardWeights: offsets = forwardOffsets
+                Else
+                    weights = reverseWeights: offsets = reverseOffsets
+                End If
+                best(0) = maxima(r): best(1) = minima(r)
+                oldMax = best(0): oldMin = best(1)
+                If direction = 0 Then
+                    TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, forwardGeometry, _
+                        autoDLA, multiplier, axleFactor, False, best, govLead, govMask, govBase, govSide
+                Else
+                    TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, reverseGeometry, _
+                        autoDLA, multiplier, axleFactor, True, best, govLead, govMask, govBase, govSide
+                End If
+                maxima(r) = best(0): minima(r) = best(1)
+                If r >= rOffset And best(0) > oldMax Then m_OptimizedSupport(2, r - rOffset) = govLead(0)
+                If caseLabel = "Truck" Then
+                    For row = 0 To 1
+                        If (row = 0 And best(row) > oldMax) Or (row = 1 And best(row) < oldMin) Then
+                            m_TruckGovLead(row, r) = govLead(row): m_TruckGovMask(row, r) = govMask(row)
+                            m_TruckGovSide(row, r) = govSide(row): m_TruckGovReverse(row, r) = direction = 1
+                            m_TruckGovBase(row, r) = govBase(row): m_TruckGovValue(row, r) = best(row)
+                            If m_IsBCLTruck Then m_TruckGovSpacing(row, r) = activeSpacings(2)
+                        End If
+                    Next row
+                End If
+            Next direction
+NextTruckResponse:
+        Next r
         For direction = 0 To 1
             If direction = 0 Then
                 weights = forwardWeights: offsets = forwardOffsets
             Else
                 weights = reverseWeights: offsets = reverseOffsets
             End If
-            best(0) = maxima(r): best(1) = minima(r)
-            oldMax = best(0): oldMin = best(1)
-            If direction = 0 Then
-                TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, forwardGeometry, _
-                    autoDLA, multiplier, axleFactor, False, best, govLead, govMask, govBase, govSide
-            Else
-                TruckResponseExtrema r, weights, offsets, nAxles, nodes, knots, responseCoeffs, reverseGeometry, _
-                    autoDLA, multiplier, axleFactor, True, best, govLead, govMask, govBase, govSide
-            End If
-            maxima(r) = best(0): minima(r) = best(1)
-            If r >= rOffset And best(0) > oldMax Then m_OptimizedSupport(2, r - rOffset) = govLead(0)
-            If caseLabel = "Truck" Then
-                For row = 0 To 1
-                    If (row = 0 And best(row) > oldMax) Or (row = 1 And best(row) < oldMin) Then
-                        m_TruckGovLead(row, r) = govLead(row): m_TruckGovMask(row, r) = govMask(row)
-                        m_TruckGovSide(row, r) = govSide(row): m_TruckGovReverse(row, r) = direction = 1
-                        m_TruckGovBase(row, r) = govBase(row): m_TruckGovValue(row, r) = best(row)
-                    End If
-                Next row
-            End If
+            ReDim cursor(nAxles - 1)
+            For p = 0 To nSteps - 1
+                For s = 0 To nSupports - 1
+                    r = rOffset + s
+                    TruckPolynomialPair r, steps(p), steps(p), 0, weights, offsets, nAxles, nodes, _
+                        autoDLA, multiplier, axleFactor, direction = 1, polynomial, masks, bases, cursor, responseCoeffs, emptyGeometry, True
+                    value = polynomial(0, 0) + UMaxR(s)
+                    If value > MaxR(p, s) Then MaxR(p, s) = value
+                    value = polynomial(0, 1) + UMinR(s)
+                    If value < MinR(p, s) Then MinR(p, s) = value
+                Next s
+            Next p
         Next direction
-NextTruckResponse:
-    Next r
-    For direction = 0 To 1
-        If direction = 0 Then
-            weights = forwardWeights: offsets = forwardOffsets
-        Else
-            weights = reverseWeights: offsets = reverseOffsets
-        End If
-        ReDim cursor(nAxles - 1)
-        For p = 0 To nSteps - 1
-            For s = 0 To nSupports - 1
-                r = rOffset + s
-                TruckPolynomialPair r, steps(p), steps(p), 0, weights, offsets, nAxles, nodes, _
-                    autoDLA, multiplier, axleFactor, direction = 1, polynomial, masks, bases, cursor, responseCoeffs, emptyGeometry, True
-                value = polynomial(0, 0) + UMaxR(s)
-                If value > MaxR(p, s) Then MaxR(p, s) = value
-                value = polynomial(0, 1) + UMinR(s)
-                If value < MinR(p, s) Then MinR(p, s) = value
-            Next s
-        Next p
-    Next direction
+    Next spacingIndex
     For i = 0 To 2 * nElems - 1
         MaxV(i) = maxima(i) + UMaxV(i): MinV(i) = minima(i) + UMinV(i)
     Next i
@@ -1593,6 +1685,13 @@ NextTruckResponse:
     If caseLabel = "Truck" Then m_TruckGovReady = True
 End Sub
 
+Private Function GoverningTruckSpacings(row As Long, response As Long, spacings() As Double) As Double()
+    Dim result() As Double
+    result = spacings
+    If m_IsBCLTruck Then result(2) = m_TruckGovSpacing(row, response)
+    GoverningTruckSpacings = result
+End Function
+
 Private Function ReconstructedTruckResponse(response As Long, forMax As Boolean, _
     axles() As Double, spacings() As Double, nAxles As Long, elemLens() As Double, nElems As Long, _
     nDOF As Long, E_Val As Double, I_Val As Double, K_Global() As Double, _
@@ -1604,6 +1703,8 @@ Private Function ReconstructedTruckResponse(response As Long, forMax As Boolean,
     Dim row As Long, i As Long, original As Long, e As Long, reverse As Boolean
     Dim offset As Double, position As Double, xi As Double, factor As Double
     row = 1: If forMax Then row = 0
+    Dim governingSpacings() As Double
+    governingSpacings = GoverningTruckSpacings(row, response, spacings)
     reverse = m_TruckGovReverse(row, response)
     ReDim nodes(nElems), F(nDOF - 1), loads(nElems - 1, 3)
     For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
@@ -1622,7 +1723,7 @@ Private Function ReconstructedTruckResponse(response As Long, forMax As Boolean,
             AddElementPointLoad F, loads, e, elemLens(e), xi, axles(original) * factor
         End If
         If i < nAxles - 1 Then
-            If reverse Then offset = offset + spacings(nAxles - 2 - i) Else offset = offset + spacings(i)
+            If reverse Then offset = offset + governingSpacings(nAxles - 2 - i) Else offset = offset + governingSpacings(i)
         End If
     Next i
     U = SolveFactored(F, nDOF)
@@ -1673,6 +1774,10 @@ Private Sub WriteTruckDiagnostics(xNodes() As Double, xShear() As Double, _
     ws.Cells(firstRow + 3, 1).Resize(1, 11).Font.Bold = True
     ws.Cells(firstRow + 3, 12).Value = "Checked node / shear face"
     ws.Cells(firstRow + 3, 12).Font.Bold = True
+    If m_IsBCLTruck Then
+        ws.Cells(firstRow + 3, 13).Value = "Governing axle 3-4 spacing (m)"
+        ws.Cells(firstRow + 3, 13).Font.Bold = True
+    End If
     ReDim nodes(nElems)
     For i = 0 To nElems - 1: nodes(i + 1) = nodes(i) + elemLens(i): Next i
     For g = 0 To 3
@@ -1695,6 +1800,7 @@ Private Sub WriteTruckDiagnostics(xNodes() As Double, xShear() As Double, _
         ws.Cells(row, 7).Value = base: ws.Cells(row, 8).Value = multiplier: ws.Cells(row, 9).Value = base * multiplier
         ws.Cells(row, 10).Value = m_TruckGovValue(maxRow, r)
         ws.Cells(row, 11).Value = femChecks(g)
+        If m_IsBCLTruck Then ws.Cells(row, 13).Value = m_TruckGovSpacing(maxRow, r)
         If g < 2 Then
             ws.Cells(row, 12).Value = "Node " & (r - 2 * nElems + 1)
         Else
@@ -1704,8 +1810,10 @@ Private Sub WriteTruckDiagnostics(xNodes() As Double, xShear() As Double, _
     row = firstRow + 10
     ws.Cells(row, 1).Resize(1, 7).Value = Array("Case", "Axle ID", "Load (kN)", "Position (m)", "Included", "Static contribution", "Factored contribution")
     ws.Cells(row, 1).Resize(1, 7).Font.Bold = True
+    Dim governingSpacings() As Double
     For g = 0 To 3
         r = responses(g): maxRow = g Mod 2: offset = 0#: factor = axleFactor
+        governingSpacings = GoverningTruckSpacings(maxRow, r, spacings)
         If autoDLA Then factor = factor * (1# + m_TruckGovBase(maxRow, r) * multiplier)
         For i = 0 To nAxles - 1
             original = i
@@ -1724,7 +1832,7 @@ Private Sub WriteTruckDiagnostics(xNodes() As Double, xShear() As Double, _
             row = row + 1
             ws.Cells(row, 1).Resize(1, 7).Value = Array(labels(g), original + 1, axles(original), position, included, value, IIf(included, value * factor, 0#))
             If i < nAxles - 1 Then
-                If m_TruckGovReverse(maxRow, r) Then offset = offset + spacings(nAxles - 2 - i) Else offset = offset + spacings(i)
+                If m_TruckGovReverse(maxRow, r) Then offset = offset + governingSpacings(nAxles - 2 - i) Else offset = offset + governingSpacings(i)
             End If
         Next i
     Next g
@@ -3070,6 +3178,8 @@ Sub WriteResultBlock(ws As Worksheet, col0 As Long, label As String, _
 
     ' Nodal results
     ws.Cells(1, col0).Value = UCase(label) & " - NODAL RESULTS"
+    If m_IsBCLTruck Then ws.Cells(1, col0).Value = ws.Cells(1, col0).Value & _
+        " (BCL-625; V=6.6:0.5:17.6 + 18 m)"
     ws.Cells(1, col0).Font.Bold = True
 
     ws.Cells(2, col0).Resize(1, 5).Value = _

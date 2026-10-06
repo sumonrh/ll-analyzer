@@ -42,6 +42,16 @@ Regression tests compare continuous extrema against the legacy dense LU/whole-sp
 
 ## How to Use
 
+### Excel VBA truck selection
+
+In [LL Analysis VBA Code.txt](LL%20Analysis%20VBA%20Code.txt), the generated **LL Input!B8** dropdown selects **CL-625** (default) or **BCL-625**. Existing input sheets gain this selector when Analyze is run. CL-625 continues to use the editable axle table unchanged; switching to BCL-625 does not overwrite that table.
+
+BCL-625 uses axle loads **50, 140, 140, 175, 120 kN** and successive gaps **3.6, 1.2, V, 6.6 m**, as in the supplied figure. The algorithm analyzes **24 configurations**: V = **6.6, 7.1, ... , 17.6 m**, followed by **18.0 m** (a final 0.4 m step). Each configuration is optimized continuously in truck position, in both orientations. Shear, moment, deflection, optimized support maxima/minima and sampled reaction histories are enveloped over every configuration. Truck, Lane and combined Envelope cases retain their existing DLA and lane-load rules; the UDL influence zones and stiffness factorization are reused.
+
+Results identify BCL-625, and governing truck moment/shear diagnostics report the controlling axle 3-4 spacing and reconstruct that configuration for the FEM check. **B33 remains the truck-position sampling increment**, not the variable-spacing increment. This is a discrete 0.5 m spacing search, not continuous optimization in V; check mesh/spacing convergence and obtain engineering review for design use. These options apply to the Excel VBA only; the web application is unchanged.
+
+On Windows with Excel installed and **Trust access to the VBA project object model** enabled, run `powershell -NoProfile -File .\tests\vba-truck-spacing.test.ps1` for the Excel/VBA regression checks. The runner creates and closes its own unsaved workbook; it does not change Excel security settings.
+
 1. **Configuration:** 
    - Set the structural material properties such as Young's Modulus ($E$) and Moment of Inertia ($I$).
    - Choose Truck, Lane, or Envelope and adjust mesh and base sweep increment.
