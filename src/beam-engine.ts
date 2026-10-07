@@ -1,6 +1,7 @@
 export type Span = { id: string; length: number };
 export type Axle = { id: string; load: number; spacing: number };
 export type LoadCase = 'truck' | 'lane' | 'envelope';
+export type TruckModel = 'CL-625' | 'BCL-625' | 'Custom';
 export type AnalysisConfig = {
     E: number;
     I: number;
@@ -10,9 +11,11 @@ export type AnalysisConfig = {
     dlaOverride?: number | null;
     dlaMultiplier?: number;
     laneUdl?: number | null;
+    truckModel?: TruckModel;
+    bclSubdivision?: number;
 };
 export type EnvelopePoint = { x: number; max: number; min: number };
-export type ReactionEnvelope = EnvelopePoint & { govPos: number };
+export type ReactionEnvelope = EnvelopePoint & { govPos: number; govSpacing?: number };
 export type UdlInterval = {
     envelope: 'max' | 'min';
     element: number;
@@ -60,6 +63,7 @@ export type AnalysisResults = CaseResults & {
     baseIncrement: number;
     incrementReason: string;
     elapsedMs: number;
+    bclSpacings: number[];
     udlTracer?: UdlTracer;
     stats: { factorizations: number; truckSolves: number; influenceSolves: number; udlIntegrations: number };
 };
@@ -80,6 +84,23 @@ export const DEFAULT_AXLES: Axle[] = [
     { id: 'a4', load: 175, spacing: 6.6 },
     { id: 'a5', load: 150, spacing: 0 },
 ];
+export const BCL_AXLES: Axle[] = DEFAULT_AXLES.map((axle, i) => ({
+    ...axle, load: [50, 140, 140, 175, 120][i],
+}));
+export const BCL_SUBDIVISIONS = [0.5, 1, 2] as const;
+
+export function buildBclSpacings(subdivision = 1): number[] {
+    if (!BCL_SUBDIVISIONS.some(value => value === subdivision))
+        throw new Error('BCL spacing subdivision must be 0.5, 1 or 2 m.');
+    const values = Array.from({ length: Math.floor(11.4 / subdivision) + 1 },
+        (_, i) => Number((6.6 + i * subdivision).toFixed(1)));
+    return [...values, 18];
+}
+
+export function resolveTruckAxles(axles: Axle[], model?: TruckModel): Axle[] {
+    return (model === 'BCL-625' ? BCL_AXLES : model === 'CL-625' ? DEFAULT_AXLES : axles)
+        .map(axle => ({ ...axle }));
+}
 export const DEFAULT_CONFIG: AnalysisConfig = {
     E: 200000000000, I: 0.005, nElemsPerSpan: 40, truckIncrement: 0.25,
     loadCase: 'truck', dlaOverride: null, dlaMultiplier: 1, laneUdl: 9,
@@ -191,6 +212,9 @@ export function computeEffectiveIncrement(
 }
 
 export function validateInputs({ spans, axles, config }: AnalysisRequest): void {
+    if (config.truckModel != null && !['CL-625', 'BCL-625', 'Custom'].includes(config.truckModel))
+        throw new Error('Choose CL-625, BCL-625 or Custom.');
+    if (config.truckModel === 'BCL-625') buildBclSpacings(config.bclSubdivision ?? 1);
     if (spans.length < 1) throw new Error('At least one span is required.');
     spans.forEach((span, i) => {
         if (!Number.isFinite(span.length) || span.length <= 0)
@@ -240,7 +264,8 @@ function reverseAxles(axles: Axle[]): Axle[] {
     }));
 }
 
-export function buildTruckPositions(supports: number[], axles: Axle[], step: number): number[] {
+export function buildTruckPositions(supports: number[], axles: Axle[], step: number,
+    configurations: Axle[][] = [axles]): number[] {
     const truckLength = axles.slice(0, -1).reduce((sum, a) => sum + a.spacing, 0);
     const start = -truckLength;
     const end = supports[supports.length - 1] + truckLength;
@@ -248,7 +273,7 @@ export function buildTruckPositions(supports: number[], axles: Axle[], step: num
     const uniform = Array.from({ length: count }, (_, i) => Math.min(end, start + i * step));
     uniform[uniform.length - 1] = end;
     const positions = new Set(uniform);
-    for (const direction of [axles, reverseAxles(axles)]) {
+    for (const direction of configurations.flatMap(truck => [truck, reverseAxles(truck)])) {
         for (const support of supports) {
             let distance = 0;
             for (let i = 0; i < direction.length; i++) {
@@ -1298,23 +1323,28 @@ export function analyzeBeam(
     request: AnalysisRequest, onProgress?: (progress: AnalysisProgress) => void
 ): AnalysisResults {
     const started = performance.now();
-    validateInputs(request);
-    const { spans, axles, config } = request;
+    validateInputs({ ...request, axles: resolveTruckAxles(request.axles, request.config.truckModel) });
+    const { spans, config } = request;
+    const axles = resolveTruckAxles(request.axles, config.truckModel);
+    const bclSpacings = config.truckModel === 'BCL-625' ? buildBclSpacings(config.bclSubdivision ?? 1) : [];
+    const configurations = bclSpacings.length
+        ? bclSpacings.map(spacing => axles.map((axle, i) => i === 2 ? { ...axle, spacing } : axle))
+        : [axles];
+    const longestTruck = configurations[configurations.length - 1];
     const dla = resolveDla(config);
     onProgress?.({ fraction: 0, message: 'Factorizing beam stiffness...' });
     const system = new BeamSystem(spans, config);
     const nElems = system.nElems;
     const nSupports = system.supports.length;
     const nResponses = system.response.length;
-    const stepInfo = computeEffectiveIncrement(spans, axles, config.truckIncrement, config.nElemsPerSpan);
-    const positions = buildTruckPositions(system.supports, axles, stepInfo.effective);
+    const stepInfo = computeEffectiveIncrement(spans, longestTruck, config.truckIncrement, config.nElemsPerSpan);
+    const positions = buildTruckPositions(system.supports, longestTruck, stepInfo.effective, configurations);
     if (positions.length * nSupports > 2000000)
         throw new Error('Reaction histories exceed 2,000,000 ordinates per case. Reduce the span or axle count.');
     onProgress?.({ fraction: 0.02, message: 'Generating influence functions...' });
     const { coeffs } = buildInfluenceCache(system);
     let udlIntegrations = 0;
     const baseAxles = axles.map(a => a.load);
-    const spacings = axles.map(a => a.spacing);
     const nAxles = axles.length;
 
     const runCase = (
@@ -1323,17 +1353,40 @@ export function analyzeBeam(
     ) => {
         const { max: udlMax, min: udlMin } = calculateUDLEnvelopes(coeffs, nElems, nResponses, system.lengths, wUdl);
         if (wUdl > 0) udlIntegrations += nElems * nResponses;
-        const env = runInfluenceTruckEnvelope(
-            axleFactor, autoDLA, multiplier, baseAxles, spacings, nAxles,
-            system.xNodes, nElems, nResponses, coeffs, positions, nSupports,
-            udlMax, udlMin,
-            (fraction, message) => onProgress?.({
-                fraction: (config.loadCase === 'envelope' && label === 'Lane' ? 0.48 : 0.02) +
-                    fraction * (config.loadCase === 'envelope' ? 0.46 : 0.92),
-                message,
-            }),
-            label
-        );
+        let env: ReturnType<typeof runInfluenceTruckEnvelope> | undefined;
+        const optGovSpacing = new Float64Array(nSupports).fill(bclSpacings[0] ?? 0);
+        for (let index = 0; index < configurations.length; index++) {
+            const current = runInfluenceTruckEnvelope(
+                axleFactor, autoDLA, multiplier, baseAxles, configurations[index].map(a => a.spacing), nAxles,
+                system.xNodes, nElems, nResponses, coeffs, positions, nSupports,
+                udlMax, udlMin,
+                (fraction, message) => onProgress?.({
+                    fraction: (config.loadCase === 'envelope' && label === 'Lane' ? 0.48 : 0.02) +
+                        (index + fraction) / configurations.length * (config.loadCase === 'envelope' ? 0.46 : 0.92),
+                    message: bclSpacings.length ? `${message}; V=${bclSpacings[index]} m (${index + 1}/${configurations.length})` : message,
+                }),
+                label
+            );
+            if (!env) env = current;
+            else {
+                for (let s = 0; s < nSupports; s++) {
+                    if (current.optMax[s] > env.optMax[s]) {
+                        env.optGov[s] = current.optGov[s];
+                        optGovSpacing[s] = bclSpacings[index];
+                    }
+                }
+                for (const [maximum, minimum] of [
+                    ['maxima', 'minima'], ['histMax', 'histMin'], ['optMax', 'optMin'],
+                ] as const) {
+                    for (let i = 0; i < env[maximum].length; i++) {
+                        env[maximum][i] = Math.max(env[maximum][i], current[maximum][i]);
+                        env[minimum][i] = Math.min(env[minimum][i], current[minimum][i]);
+                    }
+                }
+                env.truckSolves += current.truckSolves;
+            }
+        }
+        if (!env) throw new Error('No truck configurations were analyzed.');
         // Final envelopes: continuous truck optima + UDL zones
         const finalMax = new Float64Array(nResponses);
         const finalMin = new Float64Array(nResponses);
@@ -1341,7 +1394,7 @@ export function analyzeBeam(
             finalMax[i] = env.maxima[i] + udlMax[i];
             finalMin[i] = env.minima[i] + udlMin[i];
         }
-        return { ...env, udlMax, udlMin, finalMax, finalMin };
+        return { ...env, optGovSpacing, udlMax, udlMin, finalMax, finalMin };
     };
 
     type BuiltCase = ReturnType<typeof runCase> & { dlaAuto: boolean; dlaBase: number; dlaMultiplier: number; dlaUsed: number };
@@ -1367,6 +1420,7 @@ export function analyzeBeam(
             })));
         const reactions: ReactionEnvelope[] = system.supports.map((x, s) => ({
             x, max: b.optMax[s], min: b.optMin[s], govPos: b.optGov[s],
+            ...(bclSpacings.length ? { govSpacing: b.optGovSpacing[s] } : {}),
         }));
         return {
             shear, moment, deflection, reactionDiagrams, reactions,
@@ -1401,6 +1455,7 @@ export function analyzeBeam(
                 max: Math.max(p.max, lmax),
                 min: Math.min(p.min, lmin),
                 govPos: useLane ? lane.reactions[s].govPos : p.govPos,
+                ...(bclSpacings.length ? { govSpacing: useLane ? lane.reactions[s].govSpacing : p.govSpacing } : {}),
             };
         });
         cases.envelope = {
@@ -1428,11 +1483,13 @@ export function analyzeBeam(
     if (built.lane) truckSolves += built.lane.truckSolves;
     return {
         ...selected, cases, loadCase: config.loadCase, spans: spans.map(s => ({ ...s })),
-        axles: axles.map(a => ({ ...a })), config: { ...config, dlaMultiplier: dla.multiplier, laneUdl: config.laneUdl ?? LANE_UDL },
+        axles: axles.map(a => ({ ...a })), config: { ...config, truckModel: config.truckModel ?? 'Custom',
+            ...(bclSpacings.length ? { bclSubdivision: config.bclSubdivision ?? 1 } : {}),
+            dlaMultiplier: dla.multiplier, laneUdl: config.laneUdl ?? LANE_UDL },
         xNodes: system.xNodes, supportPositions: system.supports, truckPositions: positions,
         incrementUsed: stepInfo.effective, baseIncrement: config.truckIncrement,
         incrementReason: stepInfo.reason, elapsedMs: performance.now() - started,
-        udlTracer,
+        udlTracer, bclSpacings,
         stats: { factorizations: 1, truckSolves, influenceSolves: 4 * nElems, udlIntegrations },
     };
 }

@@ -4,10 +4,12 @@ import AnalysisWorker from './analysis.worker?worker&inline';
 import {
     DEFAULT_SPANS, DEFAULT_AXLES, DEFAULT_CONFIG, MAX_AXLES,
     computeEffectiveIncrement,
+    BCL_SUBDIVISIONS, buildBclSpacings, resolveTruckAxles,
 } from './beam-engine';
 import type {
     Span, Axle, AnalysisConfig, AnalysisResults, AnalysisResponse,
     EnvelopePoint, ReactionEnvelope, LoadCase, CaseResults, AnalysisProgress,
+    TruckModel,
 } from './beam-engine';
 
 type SheetJs = {
@@ -726,7 +728,8 @@ const BeamReactionDiagram = ({
 export default function BeamAnalysisApp() {
     const [spans, setSpans] = useState<Span[]>(DEFAULT_SPANS);
     const [axles, setAxles] = useState<Axle[]>(DEFAULT_AXLES);
-    const [config, setConfig] = useState<AnalysisConfig>(DEFAULT_CONFIG);
+    const [config, setConfig] = useState<AnalysisConfig>({ ...DEFAULT_CONFIG, truckModel: 'CL-625', bclSubdivision: 1 });
+    const customAxlesRef = useRef<Axle[]>(DEFAULT_AXLES.map(axle => ({ ...axle })));
     const [results, setResults] = useState<AnalysisResults | null>(null);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [activeTab, setActiveTab] = useState<'config' | 'results'>('config');
@@ -739,9 +742,18 @@ export default function BeamAnalysisApp() {
     useEffect(() => () => workerRef.current?.terminate(), []);
 
     const stepInfo = useMemo(
-        () => computeEffectiveIncrement(spans, axles, config.truckIncrement, config.nElemsPerSpan),
-        [spans, axles, config.truckIncrement, config.nElemsPerSpan]
+        () => {
+            const truck = resolveTruckAxles(axles, config.truckModel);
+            if (config.truckModel === 'BCL-625') truck[2].spacing = 18;
+            return computeEffectiveIncrement(spans, truck, config.truckIncrement, config.nElemsPerSpan);
+        },
+        [spans, axles, config.truckModel, config.truckIncrement, config.nElemsPerSpan]
     );
+    const selectTruckModel = (model: TruckModel) => {
+        if (config.truckModel === 'Custom') customAxlesRef.current = axles.map(axle => ({ ...axle }));
+        setAxles(model === 'Custom' ? customAxlesRef.current.map(axle => ({ ...axle })) : resolveTruckAxles([], model));
+        setConfig({ ...config, truckModel: model });
+    };
 
     // Inject SheetJS script for Excel Export
     useEffect(() => {
@@ -773,6 +785,11 @@ export default function BeamAnalysisApp() {
     };
 
     const runAnalysis = () => {
+        const analyzedAxles = resolveTruckAxles(axles, config.truckModel);
+        if (config.truckModel !== 'Custom') {
+            if (axles.length > 5) alert('CL-625 and BCL-625 use five axles. Extra axles will be ignored and erased. Select Custom to analyze them.');
+            setAxles(analyzedAxles);
+        }
         workerRef.current?.terminate();
         setAnalysisError(null);
         setIsAnalyzing(true);
@@ -811,7 +828,7 @@ export default function BeamAnalysisApp() {
                 fail(event.message || 'Could not run the analysis worker.');
             };
             worker.onmessageerror = () => fail('Could not read the analysis worker results.');
-            worker.postMessage({ spans, axles, config });
+            worker.postMessage({ spans, axles: analyzedAxles, config });
         } catch (error) {
             fail(error instanceof Error ? error.message : 'Could not start the analysis.');
         }
@@ -838,6 +855,9 @@ export default function BeamAnalysisApp() {
             xlsx.utils.book_append_sheet(wb, xlsx.utils.json_to_sheet(rows), name);
         append('Analysis Settings', [{
             'Load Case': results.loadCase,
+            'Truck Model': results.config.truckModel,
+            'BCL Spacing Subdivision (m)': results.bclSpacings.length ? results.config.bclSubdivision : '',
+            'BCL Configuration Count': results.bclSpacings.length,
             'Base Increment (m)': results.baseIncrement,
             'Effective Increment (m)': results.incrementUsed,
             'Step Control': results.incrementReason,
@@ -854,6 +874,9 @@ export default function BeamAnalysisApp() {
             'Axle': i + 1, 'Load (kN)': axle.load,
             'Spacing to Next (m)': i < results.axles.length - 1 ? axle.spacing : 0,
         })));
+        if (results.bclSpacings.length) append('BCL Spacings', results.bclSpacings.map((spacing, i) => ({
+            'Configuration': i + 1, 'Axle 3-4 Spacing (m)': spacing,
+        })));
         for (const name of ['truck', 'lane', 'envelope'] as const) {
             const data = results.cases[name];
             if (!data) continue;
@@ -864,6 +887,7 @@ export default function BeamAnalysisApp() {
                 'Support': `Support ${i + 1}`, 'Location (m)': r.x,
                 'Max Reaction (kN)': r.max, 'Min Reaction (kN)': r.min,
                 'Gov Truck Pos (m)': r.govPos, 'Applied DLA': data.dlaUsed,
+                'Governing Axle 3-4 Spacing for Max (m)': r.govSpacing ?? '',
                 'DLA Auto': data.dlaAuto, 'DLA Base': data.dlaBase, 'DLA Multiplier d': data.dlaMultiplier,
             })));
             append(`${name} Reaction Diagrams`, results.truckPositions.map((x, p) => {
@@ -913,7 +937,7 @@ export default function BeamAnalysisApp() {
                 <div className="max-w-5xl mx-auto flex justify-between items-center" >
                     <h1 className="text-xl font-bold flex items-center gap-2" >
                         <span className="bg-white text-blue-700 p-1 rounded font-black text-xs" > FEM </span>
-                        Beam Analysis < span className="text-blue-200 font-normal text-sm hidden sm:inline" >| CL - 625 Truck Moving Load </span>
+                        Beam Analysis < span className="text-blue-200 font-normal text-sm hidden sm:inline" >| {config.truckModel} Moving Load </span>
                     </h1>
                     < button
                         onClick={runAnalysis}
@@ -1012,8 +1036,8 @@ export default function BeamAnalysisApp() {
                                                     onChange={(e) => setConfig({ ...config, loadCase: e.target.value as 'truck' | 'lane' | 'envelope' })}
                                                     className="w-full bg-white border border-gray-300 rounded px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
                                                 >
-                                                    <option value="truck" > CL-625 Truck Only (Standard) </option>
-                                                    <option value="lane" >{`CL-625 Lane Load (80% Truck, no DLA + ${(config.laneUdl ?? 9)} kN/m influence zones)`}</option>
+                                                    <option value="truck" > Truck Only </option>
+                                                    <option value="lane" >{`Lane Load (80% selected truck, no DLA + ${(config.laneUdl ?? 9)} kN/m influence zones)`}</option>
                                                     <option value="envelope" > Envelope (max of Truck and Lane) </option>
                                                 </select>
                                             </div>
@@ -1036,7 +1060,7 @@ export default function BeamAnalysisApp() {
                                                         placeholder="9 (default)"
                                                     />
                                                     <span className="text-xs text-gray-600">
-                                                        Blank = 9 kN/m (CL-625). Zero removes only the UDL; the 80% lane truck remains. Applies to Lane and Envelope cases.
+                                                        Blank = 9 kN/m. Zero removes only the UDL; the 80% lane truck remains. Applies to Lane and Envelope cases.
                                                     </span>
                                                 </div>
                                             </div>
@@ -1190,7 +1214,36 @@ export default function BeamAnalysisApp() {
 
                                     < div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200" >
                                         <h2 className="text-lg font-semibold mb-2" > Truck Configuration </h2>
-                                        <p className="text-sm text-gray-500 mb-4">CL-625 defaults; customize up to {MAX_AXLES} axles. Spacing is to the next axle.</p>
+                                        <label className="block text-sm font-medium mb-3">
+                                            Truck model
+                                            <select aria-label="Truck model" value={config.truckModel} onChange={e => {
+                                                const value = e.target.value;
+                                                if (value === 'CL-625' || value === 'BCL-625' || value === 'Custom') selectTruckModel(value);
+                                            }} className="block w-full border border-gray-300 rounded p-2 mt-1">
+                                                <option>CL-625</option><option>BCL-625</option><option>Custom</option>
+                                            </select>
+                                        </label>
+                                        {config.truckModel === 'BCL-625' && (
+                                            <div className="mb-4">
+                                                <label className="block text-sm font-medium">
+                                                    BCL spacing subdivision (m)
+                                                    <select aria-label="BCL spacing subdivision (m)" value={config.bclSubdivision ?? 1}
+                                                        onChange={e => setConfig({ ...config, bclSubdivision: Number(e.target.value) })}
+                                                        className="block w-full border border-gray-300 rounded p-2 mt-1">
+                                                        {BCL_SUBDIVISIONS.map(value => <option key={value} value={value}>{value} m</option>)}
+                                                    </select>
+                                                </label>
+                                                <p className="text-xs text-gray-600 mt-2">
+                                                    Axle 3-4 gap varies from 6.6 to 18 m inclusive:
+                                                    {' '}{buildBclSpacings(config.bclSubdivision ?? 1).length} configurations, both orientations.
+                                                    The table shows the minimum gap. Smaller subdivisions take longer.
+                                                </p>
+                                            </div>
+                                        )}
+                                        <p className="text-sm text-gray-500 mb-4">Spacing is to the next axle.
+                                            {config.truckModel === 'Custom' ? ` Custom supports 1-${MAX_AXLES} axles; entries are remembered when switching trucks.`
+                                                : ' Preset rows remain editable, but Analyze restores the standard five-axle truck and warns before clearing extra axles. Use Custom for modified inputs.'}
+                                        </p>
                                         <div className="space-y-2">
                                             {
                                                 axles.map((axle, i) => (
@@ -1222,7 +1275,10 @@ export default function BeamAnalysisApp() {
                                                 onClick={() => setAxles([...axles.map((a, i) => i === axles.length - 1 ? { ...a, spacing: 3.6 } : a),
                                                     { id: `a${Date.now()}`, load: 100, spacing: 0 }])}
                                                 className="text-sm text-blue-600 disabled:opacity-30">Add Axle</button>
-                                            <button onClick={() => setAxles(DEFAULT_AXLES)} className="text-sm text-gray-600">Reset CL-625</button>
+                                            <button onClick={() => setAxles(resolveTruckAxles(DEFAULT_AXLES, config.truckModel))}
+                                                className="text-sm text-gray-600">
+                                                {config.truckModel === 'Custom' ? 'Reset to CL-625 values' : `Reset ${config.truckModel}`}
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
@@ -1247,6 +1303,11 @@ export default function BeamAnalysisApp() {
                                     {results.elapsedMs.toFixed(0)}ms | {results.stats.influenceSolves} unit-load solves | {results.stats.udlIntegrations} UDL influence integrations
                                 </span>
                             </div>
+                            <p className="text-sm text-gray-700 mb-3">
+                                Analyzed truck: <strong>{results.config.truckModel}</strong>
+                                {results.bclSpacings.length > 0 && <> | Axle 3-4 gap: 6.6-18 m |
+                                    {' '}{results.config.bclSubdivision} m subdivision | {results.bclSpacings.length} configurations enveloped</>}
+                            </p>
                             {results.incrementUsed !== undefined && (
                                 <div className="w-full bg-blue-50 border border-blue-200 rounded-lg px-4 py-2 mb-4 text-xs text-blue-800">
                                     Sweep step used: <strong>{results.incrementUsed.toFixed(3)}m</strong>
@@ -1302,12 +1363,14 @@ export default function BeamAnalysisApp() {
                                     <thead><tr className="border-b">
                                         <th className="text-left">Support</th><th>Location (m)</th>
                                         <th>Max (kN)</th><th>Min / uplift (kN)</th><th>Governing truck position (m)</th>
+                                        {results.bclSpacings.length > 0 && <th>Governing gap for max (m)</th>}
                                     </tr></thead>
                                     <tbody>{displayed.reactions.map((r, s) => (
                                         <tr key={s} className="border-b border-gray-100">
                                             <td className="text-left py-2">Support {s + 1}</td>
                                             <td>{r.x.toFixed(2)}</td><td>{r.max.toFixed(2)}</td>
                                             <td>{r.min.toFixed(2)}</td><td>{r.govPos.toFixed(3)}</td>
+                                            {results.bclSpacings.length > 0 && <td>{r.govSpacing?.toFixed(1)}</td>}
                                         </tr>
                                     ))}</tbody>
                                 </table>

@@ -14,8 +14,16 @@ try {
     $source = $source -replace '\bMsgBox\b', 'TestMsgBox'
     $harness = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'vba-truck-spacing-harness.bas') -Raw
     $module.CodeModule.AddFromString($source + "`r`n" + $harness)
-    $excel.Run("'" + $book.Name + "'!TestTruckSpacing")
-    Write-Output 'PASS: Excel VBA spacing enumeration, fixed-truck envelope parity, governing FEM reconstruction, and input/output integration.'
+    $result = $excel.Run("'" + $book.Name + "'!RunTruckSpacingTests")
+    if ($result -ne 'PASS') { throw $result }
+    $result = $excel.Run("'" + $book.Name + "'!TestCustomStorage")
+    if ($result -ne 'PASS') { throw $result }
+    $eventsModule = $book.VBProject.VBComponents.Item($book.CodeName)
+    $events = Get-Content -LiteralPath (Join-Path $root 'LL Analysis Workbook Events.txt') -Raw
+    $eventsModule.CodeModule.AddFromString(($events -replace '\bMsgBox\b', 'TestMsgBox'))
+    $result = $excel.Run("'" + $book.Name + "'!TestOptionalWorkbookEvents")
+    if ($result -ne 'PASS') { throw $result }
+    Write-Output 'PASS: All three BCL subdivisions and endpoints, spacing envelopes/FEM reconstruction, dropdown validation, editable presets with extra-axle warnings, Custom restoration and 1-20 axle analysis.'
 } finally {
     if ($book) { $book.Close($false) }
     if ($excel) {
@@ -23,6 +31,7 @@ try {
         $excel.Quit()
     }
     if ($module) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($module) }
+    if ($eventsModule) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($eventsModule) }
     if ($book) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($book) }
     if ($excel) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) }
 }

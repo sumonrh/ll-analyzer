@@ -5,7 +5,7 @@ LL Analyzer is a modern, professional web application designed for comprehensive
 ## Features
 
 - **Interactive Configuration:** Dynamically add, remove, and modify beam spans and span lengths.
-- **Customizable Moving Loads:** Support for both standard truck axle configurations and lane loads with dynamic axle spacing and load values.
+- **Customizable Moving Loads:** CL-625, BCL-625 with variable axle 3-4 spacing, and Custom vehicles/trains with up to 20 axles.
 - **VBA-Based FEM Analysis:** Continuous Euler-Bernoulli beam analysis using the equations and load rules in [LL Analysis VBA Code.txt](LL%20Analysis%20VBA%20Code.txt), with a cached banded factorization and analysis in an inline web worker.
 - **Advanced Visualizations:** Smooth, interactive SVG-based envelope charts indicating both maximum and minimum envelopes for shear, moment, and deflection.
 - **Responsive Beam Schematics:** Visual representation of beam configurations and support reactions.
@@ -42,15 +42,44 @@ Regression tests compare continuous extrema against the legacy dense LU/whole-sp
 
 ## How to Use
 
+### Web app truck selection
+
+Choose **CL-625**, **BCL-625**, or **Custom** in **Truck Configuration**. Switching to a preset fills its five-axle table immediately. Custom entries are remembered while switching trucks within the current page session. All table inputs remain editable; Analyze restores standard preset values, warns before removing any extra preset axles, and analyzes arbitrary entered geometry only in Custom mode.
+
+BCL-625 uses loads **50, 140, 140, 175, 120 kN**, gaps **3.6, 1.2, V, 6.6 m**, and the same **0.5, 1 (default), or 2 m** subdivision choices as VBA. The table shows V = 6.6 m. The solver includes **6.6 and 18 m** and envelopes **24, 13, or 7 configurations**, respectively, in both orientations for Truck, Lane and Combined Envelope. This is a discrete spacing search with continuous truck-position optimization, not continuous optimization in V.
+
+One stiffness factorization and influence cache are reused for every spacing. Reaction histories use a common grid spanning the longest truck, with alignment samples for all configurations. Results retain the analyzed truck/subdivision snapshot; later configuration changes do not relabel existing results. Support summaries include the governing gap for maximum reaction. Excel export includes truck model, subdivision, the full BCL configuration list, governing support gaps, and reaction histories enveloped across spacings. Smaller subdivisions take longer; check spacing/mesh convergence and obtain engineering review for design use.
+
 ### Excel VBA truck selection
 
-In [LL Analysis VBA Code.txt](LL%20Analysis%20VBA%20Code.txt), the generated **LL Input!B8** dropdown selects **CL-625** (default) or **BCL-625**. Existing input sheets gain this selector when Analyze is run. CL-625 continues to use the editable axle table unchanged; switching to BCL-625 does not overwrite that table.
+Paste [LL Analysis VBA Code.txt](LL%20Analysis%20VBA%20Code.txt) into a **standard VBA module** in the Excel VBA editor (Alt+F11). Save as a macro-enabled workbook and enable macros. For an existing LL Input sheet, run **Setup_Truck_Inputs** once (Alt+F8) to install the updated dropdown without running analysis. New input sheets install it automatically. No programmatic access to the VBA project is needed for normal use.
 
-BCL-625 uses axle loads **50, 140, 140, 175, 120 kN** and successive gaps **3.6, 1.2, V, 6.6 m**, as in the supplied figure. The algorithm analyzes **24 configurations**: V = **6.6, 7.1, ... , 17.6 m**, followed by **18.0 m** (a final 0.4 m step). Each configuration is optimized continuously in truck position, in both orientations. Shear, moment, deflection, optimized support maxima/minima and sampled reaction histories are enveloped over every configuration. Truck, Lane and combined Envelope cases retain their existing DLA and lane-load rules; the UDL influence zones and stiffness factorization are reused.
+The generated **LL Input!B8** dropdown selects **CL-625** (default), **BCL-625**, or **Custom**, in that order. It is an Excel **Form Control** over B8, directly wired to **Truck_Model_Changed**. Selecting Custom immediately activates the entire axle load/spacing table; selecting a preset immediately fills it. **No Analyze click or separate event module is needed.** B8 stores the selected model for analysis and printing; Analyze also synchronizes the table as a fallback.
 
-Results identify BCL-625, and governing truck moment/shear diagnostics report the controlling axle 3-4 spacing and reconstruct that configuration for the FEM check. **B33 remains the truck-position sampling increment**, not the variable-spacing increment. This is a discrete 0.5 m spacing search, not continuous optimization in V; check mesh/spacing convergence and obtain engineering review for design use. These options apply to the Excel VBA only; the web application is unchanged.
+[LL Analysis Workbook Events.txt](LL%20Analysis%20Workbook%20Events.txt) is optional: paste it into **ThisWorkbook** only if you also want direct edits/pastes to B8 to refresh immediately and truck inputs to refresh on workbook open. If ThisWorkbook already has `Workbook_SheetChange` or `Workbook_Open`, integrate the supplied handler bodies into those existing events rather than creating duplicate procedures. These handlers are not required for the Form Control dropdown.
 
-On Windows with Excel installed and **Trust access to the VBA project object model** enabled, run `powershell -NoProfile -File .\tests\vba-truck-spacing.test.ps1` for the Excel/VBA regression checks. The runner creates and closes its own unsaved workbook; it does not change Excel security settings.
+- **CL-625:** fills five loads **50, 125, 125, 175, 150 kN**, with gaps **3.6, 1.2, 6.6, 6.6 m**.
+- **BCL-625:** fills five loads **50, 140, 140, 175, 120 kN**, with gaps **3.6, 1.2, 6.6, 6.6 m**. The displayed axle 3 gap is the minimum; analysis still varies it as described below.
+- Both presets fill their table and gray unused axle rows **6-20**, without blocking typing. The worksheet remains unprotected so fonts, borders, table styles and other formatting can be edited. If loads or spacings are entered in rows 6-20, **Analyze displays a warning before ignoring and erasing those entries**. Setup does not silently erase extra entries for the currently selected preset. Selecting a different preset fills a new five-axle table; saved Custom entries are retained separately. Preset values for axles 1-5 are restored when selecting a preset or running Analyze; use Custom for modified axle inputs.
+- **Custom:** activates all **20 axle rows** for vehicles or trains. Enter 1-20 consecutive nonnegative loads and nonnegative numeric gaps between axles; the last axle's gap is ignored. A single axle and coincident axles are supported. Custom uses the entered fixed geometry, not the BCL variable-gap search.
+
+Custom entries are remembered across preset switches in a very-hidden **LL Custom Axles** worksheet and persist when the workbook is saved. Selecting Custom restores them. When first updating an existing workbook, its axle table is saved there before a preset replaces it; select Custom to recover those inputs. Run **Setup_Truck_Inputs** once after updating the module to remove existing input-sheet protection without running analysis. Setup/Analyze still apply the generated layout, and truck selection still applies active/inactive row colors.
+
+BCL-625 uses axle loads **50, 140, 140, 175, 120 kN** and successive gaps **3.6, 1.2, V, 6.6 m**, as in the supplied figure. **LL Input!B37** selects the variable-gap subdivision: **0.5, 1 (default), or 2 m**. A non-editable Form Control dropdown covers the cell; Stop-style custom data validation rejects manual typing into the underlying cell. VBA also rejects unsupported values introduced by pasting or other macros, preventing tiny increments from creating excessive analysis work. The sheet itself is not protected.
+
+Starting at **6.6 m**, the search adds the selected subdivision and always includes **18.0 m**, with a shorter final interval where needed:
+
+| Subdivision | Configurations | Variable gap sequence (m) |
+|---|---:|---|
+| 0.5 m | 24 | 6.6, 7.1, ..., 17.6, 18.0 |
+| 1 m (default) | 13 | 6.6, 7.6, ..., 17.6, 18.0 |
+| 2 m | 7 | 6.6, 8.6, ..., 16.6, 18.0 |
+
+Each configuration is optimized continuously in truck position, in both orientations. Shear, moment, deflection, optimized support maxima/minima and sampled reaction histories are enveloped over every configuration. Truck, Lane and combined Envelope cases retain their existing DLA and lane-load rules; the UDL influence zones and stiffness factorization are reused. Custom retains all entered axle rows and never uses the variable-gap search or the preset extra-axle warning.
+
+Results identify BCL-625, its selected subdivision and configuration count, and governing truck moment/shear diagnostics report the controlling axle 3-4 spacing and reconstruct that configuration for the FEM check. **B33 remains the truck-position sampling increment**, not the variable-spacing increment. This is a discrete spacing search, not continuous optimization in V; check mesh/spacing convergence and obtain engineering review for design use. Web app truck selection follows the same presets and subdivision rules.
+
+On Windows with Excel installed and **Trust access to the VBA project object model** enabled, run `powershell -NoProfile -File .\tests\vba-truck-spacing.test.ps1` for the Excel/VBA regression checks. The runner creates and closes its own unsaved workbook and verifies immediate Form Control updates **without workbook events**, optional event integration, unprotected input formatting, worksheet-backed Custom restoration and 1-20 axle analysis. It does not change Excel security settings. Save/reopen verification must be performed in an Excel environment that permits saving macro-enabled workbooks.
 
 1. **Configuration:** 
    - Set the structural material properties such as Young's Modulus ($E$) and Moment of Inertia ($I$).

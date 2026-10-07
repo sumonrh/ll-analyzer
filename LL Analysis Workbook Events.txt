@@ -1,0 +1,23 @@
+Option Explicit
+
+Private Sub Workbook_SheetChange(ByVal Sh As Object, ByVal Target As Range)
+    If Not TypeOf Sh Is Worksheet Then Exit Sub
+    If Sh.Name <> "LL Input" Then Exit Sub
+    If Application.Intersect(Target, Sh.Range("B8")) Is Nothing Then Exit Sub
+    On Error GoTo InputChangeFailed
+    RefreshTruckInputs Sh
+    Exit Sub
+InputChangeFailed:
+    MsgBox "Truck selection could not be updated: " & Err.Description, vbCritical
+End Sub
+
+Private Sub Workbook_Open()
+    Dim ws As Worksheet
+    On Error GoTo InputOpenFailed
+    For Each ws In Me.Worksheets
+        If ws.Name = "LL Input" Then RefreshTruckInputs ws: Exit For
+    Next ws
+    Exit Sub
+InputOpenFailed:
+    MsgBox "Truck inputs could not be restored: " & Err.Description, vbCritical
+End Sub
